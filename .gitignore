@@ -1,0 +1,32 @@
+# Keil / MDK-ARM build artifacts
+MDK-ARM/Balance_Car/*.o
+MDK-ARM/Balance_Car/*.d
+MDK-ARM/Balance_Car/*.crf
+MDK-ARM/Balance_Car/*.axf
+MDK-ARM/Balance_Car/*.map
+MDK-ARM/Balance_Car/*.htm
+MDK-ARM/Balance_Car/*.sct
+MDK-ARM/Balance_Car/*.lnp
+MDK-ARM/Balance_Car/*.dep
+MDK-ARM/Balance_Car/*.lst
+MDK-ARM/Balance_Car/*.bak
+MDK-ARM/*.lst
+MDK-ARM/build*.log
+MDK-ARM/*.uvguix.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Git
+.git/
