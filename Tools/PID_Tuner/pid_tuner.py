@@ -26,7 +26,9 @@ Double-click "启动PID调试助手.bat" or the desktop shortcut to launch.
 """
 import collections
 import csv
+import json
 import math
+import os
 import queue
 import sys
 import threading
@@ -235,6 +237,39 @@ def _selftest():
     print("selftest OK (protocol helpers)")
 
 
+# ---------------------------------------------------------------------------
+# Parameter snapshots ("存档"): persisted next to this script so they travel
+# with the repo. Each snapshot: name, timestamp, the 7 gains and deadband.
+# ---------------------------------------------------------------------------
+PRESET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "presets.json")
+PRESET_KEYS = ("kp", "ki", "kd", "kvp", "kvi", "ktp", "kti", "deadband")
+
+
+def load_presets():
+    """Return a list of snapshot dicts; tolerate missing/corrupt files."""
+    try:
+        with open(PRESET_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            return [p for p in data if isinstance(p, dict)]
+    except (OSError, ValueError):
+        pass
+    return []
+
+
+def save_presets(presets):
+    """Atomically write the snapshot list; return (ok, error_message)."""
+    try:
+        tmp = PRESET_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(presets, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, PRESET_FILE)
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
 class PIDTuner:
     def __init__(self, root):
         self.root = root
@@ -321,9 +356,14 @@ class PIDTuner:
         self.data = {ch: collections.deque(maxlen=BUF_POINTS) for ch, _, _ in CHANNELS}
         self.extra = {k: collections.deque(maxlen=BUF_POINTS) for k in EXTRA_COLS}
         # Gains currently believed to be live on the MCU (updated on send/ACK).
-        self.active_params = {"kp": 5.0, "ki": 0.1, "kd": 5.0,
-                              "kvp": 2.0, "kvi": 0.05,
-                              "ktp": 4.0, "kti": 3.0}
+        # Initialised to the on-car reference values now flashed into firmware.
+        self.active_params = {"kp": 3.30, "ki": 0.15, "kd": 3.00,
+                              "kvp": 0.80, "kvi": 0.065,
+                              "ktp": 3.00, "kti": 4.00}
+        # Parameter snapshots (存档), loaded from presets.json next to script.
+        self.presets = load_presets()
+        self.preset_name_var = tk.StringVar(value="")
+        self.preset_status_var = tk.StringVar(value="")
         self.active_state = 0
         self.active_offset = 0.0
         self.events = []                    # (t_s, label) clicked buttons / BST state changes
@@ -561,6 +601,41 @@ class PIDTuner:
                    command=self._three_loop_preset).grid(
                        row=nrows + 5, column=0, columnspan=3,
                        sticky="ew", pady=(8, 0))
+
+        # ---- Parameter snapshots (存档) ----
+        pf = ttk.LabelFrame(left, text="参数存档（保存好参数，随时载入/对比）",
+                            padding=8)
+        pf.pack(fill="x", pady=(0, 6))
+        name_row = ttk.Frame(pf)
+        name_row.pack(fill="x")
+        ttk.Label(name_row, text="名称").pack(side="left")
+        ttk.Entry(name_row, textvariable=self.preset_name_var,
+                  width=16).pack(side="left", padx=4)
+        ttk.Button(name_row, text="保存当前",
+                   command=self._preset_save).pack(side="left", padx=2)
+        list_frame = ttk.Frame(pf)
+        list_frame.pack(fill="x", pady=(6, 2))
+        self.preset_list = tk.Listbox(list_frame, height=5,
+                                      font=MONO, exportselection=False)
+        self.preset_list.pack(side="left", fill="x", expand=True)
+        sb = ttk.Scrollbar(list_frame, orient="vertical",
+                           command=self.preset_list.yview)
+        sb.pack(side="right", fill="y")
+        self.preset_list.config(yscrollcommand=sb.set)
+        self.preset_list.bind("<<ListboxSelect>>", self._preset_on_select)
+        btns = ttk.Frame(pf)
+        btns.pack(fill="x", pady=(2, 0))
+        ttk.Button(btns, text="载入并下发",
+                   command=self._preset_load).pack(side="left", padx=(0, 4))
+        ttk.Button(btns, text="仅填入不发送",
+                   command=self._preset_fill_only).pack(side="left", padx=4)
+        ttk.Button(btns, text="删除",
+                   command=self._preset_delete).pack(side="left", padx=4)
+        ttk.Button(btns, text="导出对比CSV",
+                   command=self._preset_export_csv).pack(side="left", padx=4)
+        ttk.Label(pf, textvariable=self.preset_status_var,
+                  foreground="#0c8599", wraplength=300).pack(anchor="w", pady=(4, 0))
+        self._preset_refresh_list()
 
         chf = ttk.LabelFrame(left, text="曲线通道", padding=8)
         chf.pack(fill="x", pady=6)
@@ -1035,6 +1110,128 @@ class PIDTuner:
         self._send_deadband()
         self._send_pid()
 
+    # ------------------------------------------------------ parameter snapshots
+    def _current_snapshot_values(self):
+        """Collect the 7 gains + deadband as strings from the UI vars."""
+        vals = {k: self._var_for(k).get() for k in PRESET_KEYS if k != "deadband"}
+        vals["deadband"] = self.deadband_var.get()
+        return vals
+
+    def _preset_refresh_list(self):
+        """Rebuild the listbox from self.presets (newest first in the file)."""
+        if not hasattr(self, "preset_list"):
+            return
+        self.preset_list.delete(0, tk.END)
+        for p in self.presets:
+            name = p.get("name", "(未命名)")
+            ts = p.get("time", "")
+            label = "%s   %s" % (name, ts) if ts else name
+            self.preset_list.insert(tk.END, label)
+
+    def _preset_save(self):
+        name = self.preset_name_var.get().strip()
+        if not name:
+            name = time.strftime("存档%m-%d %H:%M")
+        vals = self._current_snapshot_values()
+        snap = {"name": name, "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+        snap.update(vals)
+        self.presets.insert(0, snap)          # newest first
+        ok, err = save_presets(self.presets)
+        if not ok:
+            self.presets.pop(0)
+            self.preset_status_var.set("保存失败: %s" % err)
+            messagebox.showerror("存档失败", err)
+            return
+        self._preset_refresh_list()
+        self.preset_list.selection_clear(0, tk.END)
+        self.preset_list.selection_set(0)
+        self.preset_status_var.set("已保存「%s」" % name)
+        self._log("[存档] 保存 %s" % name, timestamp=True)
+
+    def _selected_preset(self):
+        sel = self.preset_list.curselection()
+        if not sel or sel[0] >= len(self.presets):
+            return None
+        return self.presets[sel[0]]
+
+    def _preset_on_select(self, _event=None):
+        p = self._selected_preset()
+        if not p:
+            return
+        parts = ["%s=%s" % (k, p.get(k, "?")) for k in PRESET_KEYS]
+        self.preset_status_var.set("  ".join(parts))
+
+    def _apply_snapshot(self, p):
+        """Push a snapshot's values into the UI vars + sliders (no sending)."""
+        for k in PRESET_KEYS:
+            if k not in p:
+                continue
+            text = str(p[k])
+            if k == "deadband":
+                self.deadband_var.set(text)
+            else:
+                self._var_for(k).set(text)
+                self._sync_slider(k)
+
+    def _preset_fill_only(self):
+        p = self._selected_preset()
+        if not p:
+            self.preset_status_var.set("先选中一个存档")
+            return
+        self._apply_snapshot(p)
+        self.preset_status_var.set("已填入「%s」，未下发（点下发全部/下发死区才生效）"
+                                   % p.get("name", "?"))
+
+    def _preset_load(self):
+        p = self._selected_preset()
+        if not p:
+            self.preset_status_var.set("先选中一个存档")
+            return
+        self._apply_snapshot(p)
+        self._send_deadband()
+        self._send_pid()
+        self.preset_status_var.set("已载入并下发「%s」" % p.get("name", "?"))
+        self._log("[存档] 载入 %s" % p.get("name", "?"), timestamp=True)
+
+    def _preset_delete(self):
+        p = self._selected_preset()
+        if not p:
+            self.preset_status_var.set("先选中一个存档")
+            return
+        name = p.get("name", "?")
+        if not messagebox.askyesno("删除存档", "确定删除「%s」？" % name):
+            return
+        self.presets.remove(p)
+        ok, err = save_presets(self.presets)
+        if not ok:
+            messagebox.showerror("删除失败", err)
+            return
+        self._preset_refresh_list()
+        self.preset_status_var.set("已删除「%s」" % name)
+
+    def _preset_export_csv(self):
+        """Export all snapshots as a CSV table for side-by-side comparison."""
+        if not self.presets:
+            self.preset_status_var.set("没有存档可导出")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            initialfile="参数存档对比.csv",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                w = csv.writer(fh)
+                w.writerow(["name", "time"] + list(PRESET_KEYS))
+                for p in self.presets:
+                    w.writerow([p.get("name", ""), p.get("time", "")] +
+                               [p.get(k, "") for k in PRESET_KEYS])
+            self.preset_status_var.set("已导出 %d 条到 %s"
+                                       % (len(self.presets), os.path.basename(path)))
+        except OSError as exc:
+            messagebox.showerror("导出失败", str(exc))
+
     def _send_deadband(self):
         """Motor deadband compensation (OFFSET,<counts>; 7200 = 100% duty)."""
         try:
@@ -1193,6 +1390,15 @@ class PIDTuner:
             "2) 角度稳了再加角度 KI(参考值 0.15)消除固定偏角；改完点 RSTI。\n"
             "3) 最后开速度环、转向环，速度环输出会带动 Target。\n"
             "4) 异常立刻「急停 BAL,0」，手扶着调。\n"
+            "\n"
+            "=== 参数存档（对比不同调参版本）===\n"
+            "  调出满意的参数后，在「参数存档」里输个名字点「保存当前」，\n"
+            "  会把 7 项增益 + 死区补偿存到脚本同目录的 presets.json。\n"
+            "  - 点列表某一项可看它的全部参数；\n"
+            "  - 「仅填入不发送」= 把该存档填回输入框先看看，不动小车；\n"
+            "  - 「载入并下发」= 填回并立即发给小车生效；\n"
+            "  - 「导出对比CSV」= 把所有存档导成表格，横向对比各版本参数。\n"
+            "  presets.json 跟脚本放一起，随仓库备份，换电脑拷走即可。\n"
             "\n"
             "=== D 项说明 ===\n"
             "  D 项 = -Kd*(本次角度-上次角度)，是角度微分先行，\n"
