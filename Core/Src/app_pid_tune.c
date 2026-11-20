@@ -1,11 +1,10 @@
 /* app_pid_tune.c - HC-05 wireless PID tuning protocol implementation
  *
- * Runtime commands are intentionally limited to the three tuning loops
- * (SET/SETV/SETT + read-back), calibration (CAL), closed-loop enable/stop
- * (BAL,0/1) and status (BST). Everything else - target speed, target turn,
- * angle trim, output sign, fault protection, deadband, motor polarity,
- * encoder direction - is fixed in firmware constants; it is not tunable
- * over the air.
+ * Runtime commands cover the three tuning loops (SET/SETV/SETT + read-back),
+ * calibration (CAL), closed-loop enable/stop (BAL,0/1), remote drive (MOV)
+ * and status (BST). Everything else - angle trim, output sign, fault
+ * protection, deadband, motor polarity, encoder direction - is fixed in
+ * firmware constants; it is not tunable over the air.
  *
  * Design notes:
  *  - Only integer printf formats are used (Keil microlib has no float printf).
@@ -27,6 +26,9 @@ static char             s_tx[PIDTUNE_TX_CAP];
 static uint16_t         s_line_len = 0U;
 static uint8_t          s_started = 0U;
 static uint32_t         s_last_tx_ms = 0U;
+static uint32_t         s_now_ms = 0U;      /* tick of the current Poll() */
+static int32_t          s_move_fwd = 0L;    /* last MOV, percent (echo guard) */
+static int32_t          s_move_turn = 0L;
 static int32_t          s_angle100 = 0L;
 static int32_t          s_tx_target100 = 0L;
 static int32_t          s_p100 = 0L;
@@ -247,15 +249,47 @@ static void HandleLine(char *line)
   {
     AppBalance_Status_t st;
     App_Balance_GetStatus(&st);
-    (void)sprintf(s_tx, "BST,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u,%ld,%ld\n",
+    (void)sprintf(s_tx,
+                  "BST,%u,%ld,%ld,%ld,%ld,%ld,%ld,%u,%ld,%ld,%ld,%ld,%ld\n",
                   (unsigned int)st.state,
                   (long)(st.angle * 100.0f),
                   (long)(st.offset * 100.0f),
                   (long)st.duty,
                   (long)st.p100, (long)st.i100, (long)st.d100,
                   (unsigned int)st.cal_progress,
-                  (long)st.vel100, (long)st.turn);
+                  (long)st.vel100, (long)st.turn,
+                  (long)st.move_fwd, (long)st.move_turn, (long)st.spd100);
     (void)HC05_SendString(s_tx);
+    return;
+  }
+
+  if (strncmp(line, "MOV,", 4U) == 0)
+  {
+    int32_t fwd, turn;
+
+    p = line + 4U;
+    if (ParseInt32(&p, &fwd) == 0U) { SendErr("MOV fwd"); return; }
+    if (*p != ',')                  { SendErr("MOV sep"); return; }
+    p++;
+    if (ParseInt32(&p, &turn) == 0U) { SendErr("MOV turn"); return; }
+    if (*p != '\0')                  { SendErr("MOV tail"); return; }
+
+    fwd  = ClampInt32(fwd, -100L, 100L);
+    turn = ClampInt32(turn, -100L, 100L);
+
+    /* The PC repeats MOV at 10 Hz as a heartbeat. Echo only when the command
+     * actually changes, otherwise the receive area would be flooded. */
+    if ((fwd != s_move_fwd) || (turn != s_move_turn))
+    {
+      AppBalance_Status_t st;
+      s_move_fwd  = fwd;
+      s_move_turn = turn;
+      App_Balance_GetStatus(&st);
+      (void)sprintf(s_tx, "ACKM,%ld,%ld,%u\n", (long)fwd, (long)turn,
+                    (unsigned int)((st.state == APP_BAL_STATE_RUN) ? 1U : 0U));
+      (void)HC05_SendString(s_tx);
+    }
+    App_Balance_SetMove(fwd, turn, s_now_ms);
     return;
   }
 
@@ -355,6 +389,8 @@ void App_PIDTune_Init(void)
   s_turn             = 0L;
   s_enc_tps          = 0L;
   s_gyro_z100        = 0L;
+  s_move_fwd         = 0L;
+  s_move_turn        = 0L;
   /* Push the initial gains into the real three-loop controller. */
   App_Balance_SetGains(s_params.kp100, s_params.ki100, s_params.kd100);
   App_Balance_SetSpeedGains(s_params.kv_p10000, s_params.kv_i10000);
@@ -388,6 +424,7 @@ void App_PIDTune_Poll(uint32_t now_ms, const MPU6050_Data_t *imu,
     s_last_tx_ms = now_ms;
   }
 
+  s_now_ms = now_ms;          /* MOV stamps its deadman with this tick */
   PollCommands();
   ComputeTerms(now_ms, imu, imu_ok);
 

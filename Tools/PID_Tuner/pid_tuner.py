@@ -9,13 +9,17 @@ Wire protocol (ASCII, LF terminated, x100 fixed point on MCU, no float printf):
                SETV,<kp*10000>,<ki*10000>       速度环
                SETT,<kp*100>,<ki*100>           转向环差速 PI
                GET / GETV / GETT                读取三组增益
-               CAL   BAL,<0|1>   BST
+               MOV,<fwd>,<turn>                 遥控行驶，百分比 -100..100
+               CAL   BAL,<0|1>   BST   SAVE
   MCU -> PC  : ACK,..   ACKV,..   ACKT,..   LOG,<text>
-               BST,<state>,<angle>,<offset>,<duty>,P,I,D,<cal%>,<vel>,<turn>
+               ACKM,<fwd>,<turn>,<running>      MOV 有变化时才回
+               BST,<state>,<angle>,<offset>,<duty>,P,I,D,<cal%>,<vel>,<turn>,
+                   <fwd>,<turn_cmd>,<spd>
                T,<ms>,<angle>,<target>,P,I,D,<pwm>,<vel>,<turn>,<enc_tps>,<gyroz>
                其中 vel/turn/enc_tps/gyroz 已按各自单位换算，PWM 为原始占空比
-  目标速度/差速、角度微调、死区、输出方向、保护、电机极性、编码器方向、轮动力
-  补偿均已固化在固件常量中，不再通过上位机下发。
+  MOV 是「失联保护」命令：上位机每 100 ms 重发一次（哪怕值没变），固件 600 ms
+  收不到就把目标斜坡降到 0 —— 蓝牙掉线/关掉软件时小车自己停下。
+  角度微调、死区、输出方向、保护、电机极性、编码器方向、轮动力补偿固化为常量。
   Motors stay OFF on power-up: hold upright -> CAL -> BAL,1. BAL,0 = stop.
 
 Double-click "启动PID调试助手.bat" or the desktop shortcut to launch.
@@ -85,11 +89,11 @@ BST_STATES = {0: "IDLE", 1: "CAL", 2: "RUN", 3: "FAULT"}
 
 
 def parse_bst(line):
-    """'BST,state,angle,offset,duty,p,i,d,cal[,vel,turn]' -> dict."""
+    """'BST,state,angle,offset,duty,p,i,d,cal[,vel,turn[,fwd,turncmd,spd]]'."""
     if not line.startswith("BST,"):
         return None
     parts = line.split(",")
-    if len(parts) not in (9, 11):
+    if len(parts) not in (9, 11, 14):
         return None
     try:
         v = [int(x) for x in parts[1:]]
@@ -106,6 +110,9 @@ def parse_bst(line):
         "cal": v[7],
         "vel": v[8] / 100.0 if len(v) > 8 else 0.0,
         "turn": v[9] if len(v) > 9 else 0,
+        "move_fwd": v[10] if len(v) > 10 else 0,
+        "move_turn": v[11] if len(v) > 11 else 0,
+        "spd": v[12] / 100.0 if len(v) > 12 else 0.0,
     }
 
 
@@ -146,6 +153,32 @@ def parse_ack_t(line):
         return tuple(float(x) / 100.0 for x in parts[1:])
     except ValueError:
         return None
+
+
+def build_move_command(fwd, turn, pct):
+    """Direction (-1/0/1 per axis) + 限速百分比 -> 'MOV,<fwd%>,<turn%>\\n'.
+
+    The firmware treats MOV as a deadman command, so sending the same string
+    again is a heartbeat, not a duplicate.
+    """
+    pct = max(0, min(100, int(pct)))
+    fwd = max(-1, min(1, int(fwd)))
+    turn = max(-1, min(1, int(turn)))
+    return "MOV,%d,%d\n" % (fwd * pct, turn * pct)
+
+
+def parse_ack_m(line):
+    """'ACKM,<fwd>,<turn>,<running>' -> (fwd, turn, running), or None."""
+    if not line.startswith("ACKM,"):
+        return None
+    parts = line.split(",")
+    if len(parts) != 4:
+        return None
+    try:
+        fwd, turn, run = (int(x) for x in parts[1:])
+    except ValueError:
+        return None
+    return fwd, turn, run
 
 
 def parse_telemetry(line):
@@ -199,6 +232,21 @@ def _selftest():
     assert b["duty"] == 345 and b["p"] == 2.0 and b["d"] == 0.5
     assert b["vel"] == -1.5 and b["turn"] == 25
     assert parse_bst("BST,0,1") is None
+
+    # --- motion control helpers ---
+    assert build_move_command(1, 0, 60) == "MOV,60,0\n"
+    assert build_move_command(-1, 1, 100) == "MOV,-100,100\n"
+    assert build_move_command(0, 0, 50) == "MOV,0,0\n"
+    assert build_move_command(2, -2, 250) == "MOV,100,-100\n"   # clamped
+    m = parse_ack_m("ACKM,60,0,1")
+    assert m == (60, 0, 1), m
+    assert parse_ack_m("ACKM,-40,-25,0") == (-40, -25, 0)
+    assert parse_ack_m("ACKM,1,2") is None
+    assert parse_ack_m("MOV,1,2") is None
+    b = parse_bst("BST,2,150,-120,345,200,0,50,100,-150,25,60,-30,85")
+    assert b is not None
+    assert b["move_fwd"] == 60 and b["move_turn"] == -30 and b["spd"] == 0.85
+    assert parse_bst("BST,2,150,-120,345,200,0,50,100,-150,25")["move_fwd"] == 0
     print("selftest OK (protocol helpers)")
 
 
@@ -300,6 +348,11 @@ class PIDTuner:
         self.demo = tk.BooleanVar(value=False)
         self.motor_state = tk.StringVar(value="IDLE · 电机停")
         self.bal_state = tk.StringVar(value="state --")
+        # 运动控制：限速百分比 + 当前按住的方向 + 小车回执
+        self.move_pct_var = tk.DoubleVar(value=40.0)
+        self.move_pct_lbl = tk.StringVar(value="40%")
+        self.move_cmd_var = tk.StringVar(value="目标：停")
+        self.move_car_var = tk.StringVar(value="小车：--")
 
         self.ser = None
         self.reader = None
@@ -331,6 +384,10 @@ class PIDTuner:
         self._demo_ms = 0
         self._last_bst_query = 0.0
         self._save_pending = 0.0            # monotonic stamp of the last SAVE, 0 = idle
+        # 运动控制：按住的键（w/s/a/d）、上次发送的命令、心跳时间戳
+        self._move_keys = set()
+        self._last_move_cmd = ""
+        self._last_move_tick = 0.0
 
         self._build_ui()
         self._refresh_ports()
@@ -635,20 +692,61 @@ class PIDTuner:
         ttk.Checkbutton(bar, text="自动滚动", variable=self.auto_scroll).pack(side="left", padx=6)
         ttk.Checkbutton(bar, text="时间戳", variable=self.show_ts).pack(side="left", padx=6)
         ttk.Checkbutton(bar, text="HEX 显示", variable=self.hex_rx).pack(side="left", padx=6)
-        self.rx_text = scrolledtext.ScrolledText(rxf, height=8, wrap=tk.WORD,
+        self.rx_text = scrolledtext.ScrolledText(rxf, height=6, wrap=tk.WORD,
                                                  font=MONO, bg="#fbfcfd")
         self.rx_text.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
-        mb = ttk.LabelFrame(self.root, text="平衡控制（先扶正标定，再使能）", padding=(6, 4))
+        mb = ttk.LabelFrame(self.root,
+                            text="平衡与运动控制（先标定 → 开始平衡 → 按住方向键行驶）",
+                            padding=(6, 4))
         mb.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 0))
-        ttk.Button(mb, text="① 扶正标定 CAL", command=self._bal_cal).pack(side="left", padx=(2, 2))
-        ttk.Button(mb, text="② 开始平衡", command=self._bal_on).pack(side="left", padx=2)
-        ttk.Button(mb, text="急停 BAL,0", command=self._bal_off).pack(side="left", padx=2)
-        ttk.Button(mb, text="状态", command=self._bal_query).pack(side="left", padx=2)
-        ttk.Label(mb, textvariable=self.motor_state,
+
+        brow = ttk.Frame(mb)
+        brow.grid(row=0, column=0, sticky="ew")
+        ttk.Button(brow, text="① 扶正标定 CAL", command=self._bal_cal).pack(side="left", padx=(2, 2))
+        ttk.Button(brow, text="② 开始平衡", command=self._bal_on).pack(side="left", padx=2)
+        ttk.Button(brow, text="急停 BAL,0", command=self._bal_off).pack(side="left", padx=2)
+        ttk.Button(brow, text="状态", command=self._bal_query).pack(side="left", padx=2)
+        ttk.Label(brow, textvariable=self.motor_state,
                   foreground="#0c8599").pack(side="left", padx=(8, 0))
-        ttk.Label(mb, textvariable=self.bal_state, font=MONO,
+        ttk.Label(brow, textvariable=self.bal_state, font=MONO,
                   foreground="#495057").pack(side="left", padx=(6, 0))
+
+        # ---- 运动控制：方向键按住即走，松手/掉线自动停 ----
+        mrow = ttk.Frame(mb)
+        mrow.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+
+        pad = ttk.Frame(mrow)
+        pad.pack(side="left", padx=(2, 10))
+        self._dir_btn(pad, "前 W", "w").pack(side="left", padx=1)
+        self._dir_btn(pad, "后 S", "s").pack(side="left", padx=1)
+        self._dir_btn(pad, "左 A", "a").pack(side="left", padx=1)
+        self._dir_btn(pad, "右 D", "d").pack(side="left", padx=1)
+        ttk.Button(pad, text="停", width=4,
+                   command=self._move_stop).pack(side="left", padx=(6, 1))
+
+        mset = ttk.Frame(mrow)
+        mset.pack(side="left", anchor="n")
+        ttk.Label(mset, text="限速（%% 满量程，100%% ≈ 1 m/s）").pack(anchor="w")
+        prow = ttk.Frame(mset)
+        prow.pack(anchor="w")
+        ttk.Scale(prow, from_=10, to=100, orient="horizontal", length=170,
+                  variable=self.move_pct_var,
+                  command=self._on_move_pct).pack(side="left")
+        ttk.Label(prow, textvariable=self.move_pct_lbl, font=MONO,
+                  width=5).pack(side="left", padx=(6, 0))
+
+        minfo = ttk.Frame(mrow)
+        minfo.pack(side="left", padx=(16, 0), anchor="n")
+        ttk.Label(minfo, textvariable=self.move_cmd_var, font=MONO,
+                  foreground="#0c8599").pack(anchor="w")
+        ttk.Label(minfo, textvariable=self.move_car_var, font=MONO,
+                  foreground="#495057").pack(anchor="w")
+        ttk.Label(minfo, text="10 Hz 心跳：蓝牙断开 0.6 s 后自动停车",
+                  foreground="#868e96").pack(anchor="w")
+
+        self.root.bind("<KeyPress>", self._on_move_key)
+        self.root.bind("<KeyRelease>", self._on_move_key_release)
 
         txf = ttk.Frame(self.root, padding=(8, 4, 8, 8))
         txf.grid(row=4, column=0, sticky="ew")
@@ -777,6 +875,7 @@ class PIDTuner:
                     self.ser.write(b"BST\n")   # track RUN / FAULT transitions
                 except Exception:
                     pass
+            self._move_tick()      # 10 Hz MOV heartbeat -> deadman stays alive
         self.root.after(20, self._poll_queue)
 
     def _mark_event(self, label):
@@ -869,6 +968,13 @@ class PIDTuner:
             self._refresh_active_params()
             self.ack_var.set("转向环已同步 (ACKT)")
             return
+        ack_m = parse_ack_m(line)
+        if ack_m is not None:
+            fwd, turn, running = ack_m
+            self.move_car_var.set(
+                "小车：前 %+d%%  转 %+d%%%s"
+                % (fwd, turn, "" if running else "  (未使能，BAL,1 后生效)"))
+            return
         b = parse_bst(line)
         if b is not None:
             name = BST_STATES.get(b["state"], "?")
@@ -877,8 +983,9 @@ class PIDTuner:
             if b["state"] != self._last_bal_state:
                 self._mark_event("BST:" + name)
                 self._last_bal_state = b["state"]
-            self.bal_state.set("angle %+.2f  offs %+.2f  duty %+d"
-                               % (b["angle"], b["offset"], b["duty"]))
+            self.bal_state.set("angle %+.2f  offs %+.2f  duty %+d  spd %.2f  cmd %+d/%+d"
+                               % (b["angle"], b["offset"], b["duty"],
+                                  b["spd"], b["move_fwd"], b["move_turn"]))
             if b["state"] == 2:
                 self.motor_state.set("RUN · 闭环中")
             elif b["state"] == 1:
@@ -1165,16 +1272,110 @@ class PIDTuner:
                 "随时点「急停 BAL,0」或发 BAL,0 停电机。\n\n继续吗？"):
             return
         if self._motor_cmd("BAL,1\n", "BAL,1"):
+            self._move_keys.clear()        # 重新使能必须重新按键，防止一使能就冲出去
+            self._send_move(log=True)      # 从「停」开始
             self.motor_state.set("已下发 BAL,1 · 等待确认")
             self._mark_event("点击 开始平衡 BAL,1")
 
     def _bal_off(self):
         if self._motor_cmd("BAL,0\n", "BAL,0"):
+            self._move_keys.clear()
+            self._send_move(log=True)      # 立刻把行驶目标归零
             self.motor_state.set("IDLE · 电机停")
             self._mark_event("点击 急停 BAL,0")
 
     def _bal_query(self):
         self._motor_cmd("BST\n", "BST")
+
+    # ---------------------------------------------------------- motion control
+    # 方向键按住即走，松手即停；MOV 同时是失联保护心跳，每 100 ms 重发一次。
+    _MOVE_KEYS = {"w": "w", "s": "s", "a": "a", "d": "d",
+                  "up": "w", "down": "s", "left": "a", "right": "d"}
+
+    def _dir_btn(self, parent, text, key):
+        """按住生效、松手停止的方向按钮（鼠标操作，与键盘等价）。"""
+        btn = ttk.Button(parent, text=text, width=5)
+        btn.bind("<ButtonPress-1>", lambda _e, k=key: self._move_press(k))
+        btn.bind("<ButtonRelease-1>", lambda _e, k=key: self._move_release(k))
+        return btn
+
+    def _typing(self):
+        """焦点在输入框/文本框里时，方向键是编辑操作，不能开车。"""
+        w = self.root.focus_get()
+        return isinstance(w, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox,
+                              tk.Listbox, ttk.Scale))
+
+    def _on_move_key(self, event):
+        if self._typing():
+            return
+        key = self._MOVE_KEYS.get((event.keysym or "").lower())
+        if key is not None:
+            self._move_press(key)
+
+    def _on_move_key_release(self, event):
+        if self._typing():
+            return
+        key = self._MOVE_KEYS.get((event.keysym or "").lower())
+        if key is not None:
+            self._move_release(key)
+
+    def _move_vector(self):
+        """按住的键 -> (前后, 转向)，各取 -1/0/1。"""
+        fwd = (1 if "w" in self._move_keys else 0) - \
+              (1 if "s" in self._move_keys else 0)
+        turn = (1 if "d" in self._move_keys else 0) - \
+               (1 if "a" in self._move_keys else 0)
+        return fwd, turn
+
+    def _on_move_pct(self, value):
+        pct = int(round(float(value)))
+        self.move_pct_lbl.set("%d%%" % pct)
+        self._send_move(log=True)      # 限速一改立刻按新幅值重发
+
+    def _move_press(self, key):
+        self._move_keys.add(key)
+        self._send_move(log=True)
+
+    def _move_release(self, key):
+        self._move_keys.discard(key)
+        self._send_move(log=True)
+
+    def _move_stop(self):
+        self._move_keys.clear()
+        self._send_move(log=True)
+
+    def _send_move(self, log=False):
+        """发 MOV（或作为心跳重发同一个值）。心跳不刷屏，只在变化时记日志。"""
+        if self.demo.get():
+            return
+        if self.ser is None or not self.ser.is_open:
+            return
+        pct = int(round(self.move_pct_var.get()))
+        fwd, turn = self._move_vector()
+        text = build_move_command(fwd, turn, pct)
+        try:
+            self.ser.write(text.encode("ascii"))
+        except Exception as exc:
+            self._log("[发送失败] %s\n" % exc)
+            return
+        changed = text != self._last_move_cmd
+        self._last_move_cmd = text
+        if changed or log:
+            self._log(">> %s" % text)
+            self.move_cmd_var.set("目标：前 %+d%%  转 %+d%%" %
+                                  (int(fwd * pct), int(turn * pct)))
+            if fwd or turn:
+                self._mark_event("MOV 前%+d%% 转%+d%%" % (int(fwd * pct),
+                                                          int(turn * pct)))
+
+    def _move_tick(self):
+        """10 Hz 心跳：即使没按键也重发，让固件的失联保护知道上位机还活着。"""
+        now = time.monotonic()
+        if now - self._last_move_tick < 0.1:
+            return
+        self._last_move_tick = now
+        self._send_move()
+
 
     def _show_help(self):
         messagebox.showinfo(
@@ -1184,10 +1385,18 @@ class PIDTuner:
             "\n"
             "PC -> 小车: SET/SETV/SETT 下发三组增益；GET/GETV/GETT 读取；\n"
             "            SAVE 存入小车 Flash(断电不丢)；CAL 扶正标定；\n"
-            "            BAL,1/BAL,0 使能/急停；BST 查状态。\n"
-            "小车 -> PC: ACK/ACKV/ACKT/LOG；BST 状态；T 遥测(25 帧/秒)。\n"
+            "            BAL,1/BAL,0 使能/急停；MOV,fwd,turn 遥控行驶；\n"
+            "            BST 查状态。\n"
+            "小车 -> PC: ACK/ACKV/ACKT/ACKM/LOG；BST 状态；T 遥测(25 帧/秒)。\n"
             "\n"
-            "固定参数(不在链路上改): 目标速度/差速=0，角度微调=0，\n"
+            "运动控制: 按住 W/S 前进后退，A/D 左右转（可同时按 = 弧形走）；\n"
+            "  松手立刻停。MOV 同时是心跳，上位机每 100 ms 重发，固件 600 ms\n"
+            "  收不到就把目标降到 0 —— 蓝牙掉线小车自己停，不会跑丢。\n"
+            "  100% = 速度环 5 rev/s(约 1 m/s) + 差速 2 rev/s；嫌快就把限速调小。\n"
+            "  方向反了：改固件 app_balance.h 的 APP_BAL_MOVE_FWD_SIGN /\n"
+            "  APP_BAL_MOVE_TURN_SIGN 为 -1，不用拆电机线。\n"
+            "\n"
+            "固定参数(不在链路上改): 角度微调=0，\n"
             "  死区=216 counts(3%)，输出方向、50°保护、电机极性、\n"
             "  编码器方向、轮动力补偿均为固件常量。\n"
             "\n"
@@ -1463,6 +1672,13 @@ class PIDTuner:
 
     # ----------------------------------------------------------------- exit
     def _on_close(self):
+        # 先发一个「前进=0/转向=0」，别让小车带着上一个方向跑掉
+        try:
+            if self.ser is not None and self.ser.is_open and not self.demo.get():
+                self.ser.write(b"MOV,0,0\n")
+                self.ser.flush()
+        except Exception:
+            pass
         self._close_port()
         self.root.destroy()
 

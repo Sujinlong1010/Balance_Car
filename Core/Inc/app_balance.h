@@ -43,6 +43,9 @@
  *  --- Commands (over HC-05, LF terminated) ---------------------------------
  *    CAL          hold upright & still; capture the centre angle and ZERO it
  *    BAL,1 / 0    enable / disable closed loop (refuses if tilted too far)
+ *    MOV,fwd,turn remote drive in percent (-100..100): fwd + = forward,
+ *                 turn + = yaw right. Deadman: re-send within 600 ms
+ *                 (the PC does it at 10 Hz) or the car ramps back to a stop.
  *    SET,kp,ki,kd angle gains, x100 (3.30 -> 330, 0.15 -> 15, 3.00 -> 300)
  *    SETV,kp,ki   speed gains, x10000 (0.80 -> 8000, 0.065 -> 650)
  *    SETT,kp,ki   turn gains, x100 (3.00 -> 300, 4.00 -> 400)
@@ -50,9 +53,9 @@
  *    BST / T      status / telemetry  (see app_pid_tune.h)
  *
  *  Everything else is fixed in the constants below, not tunable at runtime:
- *  target speed = target turn = angle trim = 0, output sign = APP_BAL_OUTPUT_SIGN,
- *  50 deg protection = on, deadband = APP_BAL_ANGLE_OFFSET (3 percent = 216
- *  counts), motor polarity / encoder direction / wheel trim = macro defaults.
+ *  angle trim = 0, output sign = APP_BAL_OUTPUT_SIGN, 50 deg protection = on,
+ *  deadband = APP_BAL_ANGLE_OFFSET (3 percent = 216 counts), motor polarity /
+ *  encoder direction / wheel trim = macro defaults.
  */
 #ifndef __APP_BALANCE_H
 #define __APP_BALANCE_H
@@ -83,7 +86,7 @@
 #define APP_BAL_SPEED_OUTMIN    (-20.0f)
 #define APP_BAL_SPEED_I_MAX     150.0f
 #define APP_BAL_SPEED_I_MIN     (-150.0f)
-/* Target speed is fixed at 0 (hold position); no joystick in this build. */
+/* Speed target comes from the PC (MOV) and defaults to 0 (hold position). */
 
 /* --- Turn loop: tuned on-car default (3.00/4.00), Kd=0, out +/-50 --------- *
  * NOTE: the tutorial's turn loop is encoder-difference PI. The old gyro-Z
@@ -94,10 +97,38 @@
 #define APP_BAL_TURN_OUTMIN     (-50.0f)
 #define APP_BAL_TURN_I_MAX      20.0f
 #define APP_BAL_TURN_I_MIN      (-20.0f)
-/* Target differential speed is fixed at 0 (drive straight). */
 
-/* --- Encoder -> motor shaft speed, tutorial constants --------------------- *
- * LeftSpeed = Encoder_Get(1) / 44.0 / 0.05 / 9.27666; */
+/* --- Motion control: remote forward / backward / spin --------------------- *
+ * The PC sends MOV,<fwd>,<turn> in PERCENT (-100..100). Percent maps to the
+ * two loop targets like this:
+ *     speed target = fwd  % x APP_BAL_SPEED_PER_PCT   [rev/s, 100 % -> 5.0]
+ *     dif   target = turn % x APP_BAL_DIF_PER_PCT     [rev/s, 100 % -> 2.0]
+ * The speed loop's Actual is the average wheel speed, so the target is a real
+ * velocity: the car leans, accelerates and then holds that speed. The turn
+ * loop's Actual is the wheel-speed DIFFERENCE, so a positive target spins the
+ * car (left wheel faster -> yaw to the right).
+ * With a 65 mm wheel 5.0 rev/s is about 1 m/s - a sane indoor top speed.
+ *
+ * Both targets are slew limited (APP_BAL_TARGET_SLEW per 50 ms tick) so a
+ * full-scale key press ramps in over ~0.5 s instead of stepping the angle
+ * target straight onto the 20 deg clamp.
+ *
+ * APP_BAL_MOVE_TIMEOUT_MS is a DEADMAN: the PC repeats MOV at 10 Hz, so if
+ * the Bluetooth link dies the targets ramp back to zero by themselves and the
+ * car simply stops instead of driving away. */
+#define APP_BAL_SPEED_PER_PCT   0.05f    /* 100 % = 5.0 rev/s  (~1 m/s) */
+#define APP_BAL_DIF_PER_PCT     0.02f    /* 100 % = 2.0 rev/s difference */
+#define APP_BAL_TARGET_SLEW     0.5f     /* rev/s per 50 ms tick */
+#define APP_BAL_MOVE_TIMEOUT_MS 600U     /* no MOV for this long -> stop */
+
+/* Flip either sign if the car drives the wrong way / turns the wrong way.
+ * Both are one-symbol fixes instead of rewiring the motors. */
+#define APP_BAL_MOVE_FWD_SIGN   (1.0f)   /* +1: W drives forward */
+#define APP_BAL_MOVE_TURN_SIGN  (1.0f)   /* +1: D turns right */
+
+/* --- Encoder -> wheel speed, tutorial constants --------------------------- *
+ * LeftSpeed = Encoder_Get(1) / 44.0 / 0.05 / 9.27666;
+ * the /9.27666 turns motor-shaft rev/s into WHEEL rev/s (gearbox). */
 #define APP_BAL_ENC_PER_REV     44.0f
 #define APP_BAL_ENC_WINDOW_S    0.05f
 #define APP_BAL_GEAR_RATIO      9.27666f
@@ -181,6 +212,9 @@ typedef struct
   int32_t turn;     /* turn-loop output in real PWM counts */
   int32_t enc_tps;  /* left+right encoder rate, pulses/s (display only) */
   int32_t gyro_z100;/* yaw rate, deg/s x100 */
+  int32_t spd100;   /* measured average wheel speed, rev/s x100 */
+  int32_t move_fwd; /* commanded drive, percent -100..100 (last MOV) */
+  int32_t move_turn;/* commanded yaw, percent -100..100 (last MOV) */
   uint8_t state;    /* AppBalance_State_t */
   uint8_t imu_ok;
   uint8_t cal_progress; /* 0..100 percent during CAL */
@@ -208,6 +242,11 @@ void    App_Balance_GetTurnGains(int32_t *kp100, int32_t *ki100);
 
 /* Reset every PID state (Target/Actual/Error/Integral/Out), not the gains. */
 void    App_Balance_ResetIntegrals(void);
+
+/* Remote drive: fwd/turn in PERCENT (-100..100), now_ms from the caller's
+ * tick. Re-send at least every APP_BAL_MOVE_TIMEOUT_MS or the car stops. */
+void    App_Balance_SetMove(int32_t fwd_pct, int32_t turn_pct, uint32_t now_ms);
+void    App_Balance_GetMove(int32_t *fwd_pct, int32_t *turn_pct);
 
 void    App_Balance_GetStatus(AppBalance_Status_t *out);
 void    App_Balance_GetImu(MPU6050_Data_t *out);

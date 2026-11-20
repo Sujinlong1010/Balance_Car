@@ -45,9 +45,21 @@ static int32_t s_vel100 = 0;         /* speed-loop output = target lean, x100 de
 static int32_t s_turn = 0;           /* turn-loop output in real PWM counts */
 static int32_t s_enc_tps = 0;        /* display only */
 
-/* Fixed operating point (not tunable over the air): target speed = 0,
- * target differential = 0, operator angle trim = 0, output sign and the
- * 50 deg cut-off come from the constants in app_balance.h. */
+/* Fixed operating point (not tunable over the air): angle trim = 0, output
+ * sign and the 50 deg cut-off come from the constants in app_balance.h. */
+
+/* Remote drive state. The PC sends MOV,fwd,turn in percent; those become the
+ * two slow-loop targets, but slew limited so a key press cannot step the
+ * angle target onto its clamp. s_move_seen/s_move_ms implement the deadman. */
+static int32_t  s_move_fwd = 0;      /* commanded, percent */
+static int32_t  s_move_turn = 0;     /* commanded, percent */
+static float    s_tgt_speed = 0.0f;  /* commanded speed target, rev/s */
+static float    s_tgt_dif = 0.0f;    /* commanded difference target, rev/s */
+static float    s_ramp_speed = 0.0f; /* slew-limited, fed to SpeedPID.Target */
+static float    s_ramp_dif = 0.0f;   /* slew-limited, fed to TurnPID.Target */
+static uint32_t s_move_ms = 0U;
+static uint8_t  s_move_seen = 0U;
+static int32_t  s_spd100 = 0;        /* measured average speed, x100 rev/s */
 
 /* Held outputs from the 50 ms loops, consumed by the 10 ms loop. */
 static float s_speed_out_hold = 0.0f;    /* deg, = SpeedPID.Out */
@@ -79,6 +91,15 @@ static float ClampF(float v, float lo, float hi)
   if (v < lo) { return lo; }
   if (v > hi) { return hi; }
   return v;
+}
+
+/* Move cur toward tgt by at most step. Used for the drive targets so that a
+ * full-scale key press becomes a ~0.5 s ramp instead of a step. */
+static float SlewF(float cur, float tgt, float step)
+{
+  if (tgt > (cur + step)) { return cur + step; }
+  if (tgt < (cur - step)) { return cur - step; }
+  return tgt;
 }
 
 /* ==========================================================================
@@ -210,7 +231,7 @@ static void UpdateAttitude(void)
  *  50 ms loops: encoder speed -> SpeedPID -> angle target, DifSpeed -> TurnPID
  * ========================================================================== */
 
-static void RunSlowLoops(void)
+static void RunSlowLoops(uint32_t now_ms)
 {
   float scale;
   float left_rps;
@@ -218,7 +239,7 @@ static void RunSlowLoops(void)
   float ave_speed;
   float dif_speed;
 
-  /* Encoder_Get(n)/44/0.05/9.27666 = motor shaft revolutions per second. */
+  /* Encoder_Get(n)/44/0.05/9.27666 = wheel revolutions per second. */
   scale = APP_BAL_ENC_PER_REV * APP_BAL_ENC_WINDOW_S * APP_BAL_GEAR_RATIO;
   left_rps  = (float)s_enc_acc_l / scale;
   right_rps = (float)s_enc_acc_r / scale;
@@ -228,6 +249,21 @@ static void RunSlowLoops(void)
   /* Display: pulses per second over the 50 ms window. */
   s_enc_tps = (int32_t)((float)(left_rps + right_rps) *
                         APP_BAL_GEAR_RATIO * (1.0f / APP_BAL_ENC_WINDOW_S));
+  s_spd100 = (int32_t)((left_rps + right_rps) * 0.5f * 100.0f);
+
+  /* Deadman: the PC re-sends MOV at 10 Hz. If it stops arriving (Bluetooth
+   * dropped, app closed) ramp the targets down instead of driving away. The
+   * reported command also goes to 0 so the PC shows what the car is doing. */
+  if ((s_move_seen != 0U) &&
+      ((uint32_t)(now_ms - s_move_ms) > (uint32_t)APP_BAL_MOVE_TIMEOUT_MS))
+  {
+    s_tgt_speed = 0.0f;
+    s_tgt_dif   = 0.0f;
+    s_move_fwd  = 0;
+    s_move_turn = 0;
+  }
+  s_ramp_speed = SlewF(s_ramp_speed, s_tgt_speed, APP_BAL_TARGET_SLEW);
+  s_ramp_dif   = SlewF(s_ramp_dif,   s_tgt_dif,   APP_BAL_TARGET_SLEW);
 
   if (s_state != APP_BAL_STATE_RUN)
   {
@@ -239,15 +275,15 @@ static void RunSlowLoops(void)
   ave_speed = (left_rps + right_rps) * 0.5f;
   dif_speed = left_rps - right_rps;
 
-  /* Speed loop holds position: target speed fixed at 0. Its output is an
-   * ANGLE in degrees, cascaded into the angle loop. */
-  s_speed_pid.Target = 0.0f;
+  /* Speed loop: target is the ramped MOV speed (0 = hold position). Its
+   * output is an ANGLE in degrees, cascaded into the angle loop. */
+  s_speed_pid.Target = s_ramp_speed;
   s_speed_pid.Actual = ave_speed;
   PID_Update(&s_speed_pid);
   s_speed_out_hold = s_speed_pid.Out;
 
-  /* Turn loop is encoder DIFFERENCE PI, target differential fixed at 0. */
-  s_turn_pid.Target = 0.0f;
+  /* Turn loop is encoder DIFFERENCE PI; target is the ramped MOV yaw. */
+  s_turn_pid.Target = s_ramp_dif;
   s_turn_pid.Actual = dif_speed;
   PID_Update(&s_turn_pid);
   s_dif_pwm = (int)(s_turn_pid.Out * APP_BAL_PWM_SCALE);
@@ -328,6 +364,11 @@ void App_Balance_ResetIntegrals(void)
   s_enc_acc_r = 0L;
   s_speed_out_hold = 0.0f;
   s_dif_pwm = 0;
+  /* Drop the ramp but keep the commanded MOV targets: the deadman (or the
+   * PC's next MOV) is what decides whether a command is still wanted. A
+   * stale command has already been zeroed by the 600 ms watchdog. */
+  s_ramp_speed = 0.0f;
+  s_ramp_dif = 0.0f;
   /* Deliberately NOT resetting s_slow_div: it is a scheduler divider, not
    * controller state. Clearing it every idle tick would starve the 50 ms
    * loop and freeze the encoder-speed readout. */
@@ -355,6 +396,7 @@ void App_Balance_Init(void)
   s_vel100 = 0;
   s_turn = 0;
   s_enc_tps = 0;
+  s_spd100 = 0;
   s_ctrl_div = 0U;
   App_Balance_ResetIntegrals();
   s_last_us = BSP_GetMicros();
@@ -406,7 +448,7 @@ void App_Balance_Tick(uint32_t now_ms)
   if (s_slow_div >= APP_BAL_SLOW_DIV)
   {
     s_slow_div = 0U;
-    RunSlowLoops();
+    RunSlowLoops(now_ms);
   }
 
   switch (s_state)
@@ -538,6 +580,25 @@ void App_Balance_GetTurnGains(int32_t *kp100, int32_t *ki100)
   if (ki100 != 0) { *ki100 = (int32_t)(s_turn_pid.Ki * 100.0f); }
 }
 
+void App_Balance_SetMove(int32_t fwd_pct, int32_t turn_pct, uint32_t now_ms)
+{
+  s_move_fwd  = (int32_t)ClampF((float)fwd_pct, -100.0f, 100.0f);
+  s_move_turn = (int32_t)ClampF((float)turn_pct, -100.0f, 100.0f);
+
+  s_tgt_speed = (float)s_move_fwd * APP_BAL_SPEED_PER_PCT * APP_BAL_MOVE_FWD_SIGN;
+  s_tgt_dif   = (float)s_move_turn * APP_BAL_DIF_PER_PCT * APP_BAL_MOVE_TURN_SIGN;
+
+  /* Refresh the deadman lease. */
+  s_move_ms   = now_ms;
+  s_move_seen = 1U;
+}
+
+void App_Balance_GetMove(int32_t *fwd_pct, int32_t *turn_pct)
+{
+  if (fwd_pct != 0)  { *fwd_pct = s_move_fwd; }
+  if (turn_pct != 0) { *turn_pct = s_move_turn; }
+}
+
 void App_Balance_GetStatus(AppBalance_Status_t *out)
 {
   if (out == 0) { return; }
@@ -553,6 +614,9 @@ void App_Balance_GetStatus(AppBalance_Status_t *out)
   out->turn = s_turn;
   out->enc_tps = s_enc_tps;
   out->gyro_z100 = (int32_t)(s_imu.gz_dps * 100.0f);
+  out->spd100 = s_spd100;
+  out->move_fwd = s_move_fwd;
+  out->move_turn = s_move_turn;
   out->state = (uint8_t)s_state;
   out->imu_ok = s_imu_ok;
   if (s_state == APP_BAL_STATE_CAL)

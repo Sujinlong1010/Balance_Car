@@ -1,9 +1,9 @@
 /* app_pid_tune.h - HC-05 wireless PID tuning protocol (application layer)
  *
- * Only runtime-tunable items and core balance commands cross the link.
- * Everything else (target speed/turn, angle trim, output sign, fault
- * protection, deadband, motor polarity, encoder direction, wheel trim) is
- * fixed in firmware constants and is NOT tunable over the air.
+ * Only runtime-tunable items and core balance/motion commands cross the link.
+ * Everything else (angle trim, output sign, fault protection, deadband, motor
+ * polarity, encoder direction, wheel trim) is fixed in firmware constants and
+ * is NOT tunable over the air.
  *
  * ASCII, LF terminated, x100 fixed point (gains noted otherwise).
  * No float printf on the MCU.
@@ -14,19 +14,28 @@
  *                                    are restored automatically at boot
  *                CAL                 zero-offset capture (hold car still)
  *                BAL,<0|1>           disable / enable the balance loop
+ *                MOV,<fwd>,<turn>    remote drive, percent -100..100.
+ *                                    fwd + = forward, turn + = yaw right.
+ *                                    DEADMAN: must repeat within 600 ms
+ *                                    (the PC does it at 10 Hz); otherwise the
+ *                                    targets ramp to 0 and the car stops.
  *                BST                 balance status snapshot
  *   MCU -> PC  : ACK,<kp100>,<ki100>,<kd100>
  *                ACKV,<kp10000>,<ki10000>
  *                ACKT,<kp100>,<ki100>
+ *                ACKM,<fwd>,<turn>,<running>   echo, only when MOV changes
  *                LOG,<text>
  *                BST,<state>,<angle100>,<offset100>,<duty>,
- *                    <p100>,<i100>,<d100>,<cal_progress>,<vel100>,<turn>
+ *                    <p100>,<i100>,<d100>,<cal_progress>,<vel100>,<turn>,
+ *                    <fwd>,<turn_cmd>,<spd100>
  *                T,<ms>,<angle100>,<target100>,<p100>,<i100>,<d100>,
  *                  <pwm100>,<vel100>,<turn>,<enc_tps>,<gyroz100>
  *
  * SET writes the REAL angle-loop gains; SETV/SETT write the speed and turn
- * loops. T/BST stream the real controller terms. No open-loop auto-drive:
- * motors coast on power-up and only move after CAL then BAL,1 is accepted.
+ * loops. MOV writes the two slow-loop TARGETS through a slew limiter, so the
+ * car leans into a commanded speed and yaws into a commanded difference.
+ * T/BST stream the real controller terms. No open-loop auto-drive: motors
+ * coast on power-up and only move after CAL then BAL,1 is accepted.
  */
 #ifndef __APP_PID_TUNE_H
 #define __APP_PID_TUNE_H
