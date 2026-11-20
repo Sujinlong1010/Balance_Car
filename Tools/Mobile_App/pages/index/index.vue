@@ -62,16 +62,22 @@
         <text class="pctval">{{ pct }}%</text>
       </view>
 
-      <!-- 双杆：左杆推前后，右杆推左右；松手自动回中 = 原地停 -->
-      <view class="sticks">
+      <!-- 双杆：左杆推前后，右杆推左右；松手自动回中 = 原地停
+
+           手势统一挂在最外层容器上，靠 touch.identifier 判断每根手指管哪根杆。
+           不能把 touchstart/touchmove 分别挂在两个杆上：安卓 WebView 只把
+           触摸流派给「手指按下时所在的那个元素」，第二根手指落下以后，
+           第一根手指的 move 就收不到了 —— 表现正是「不能同时推」。 -->
+      <view class="sticks"
+            @touchstart.stop.prevent="sticksStart"
+            @touchmove.stop.prevent="sticksMove"
+            @touchend.stop="sticksEnd" @touchcancel.stop="sticksEnd">
         <view class="stickwrap">
           <view class="stickhead">
             <text class="sticktitle">前后</text>
             <text class="sticknum" :class="pctClass(fwdPct)">{{ signed(fwdPct) }}</text>
           </view>
-          <view class="stick"
-                @touchstart="vStart" @touchmove.stop.prevent="vMove"
-                @touchend="vEnd" @touchcancel="vEnd">
+          <view class="stick" id="stickV">
             <view class="axis-v"></view>
             <view class="knob" :class="{ snap: snapV }"
                   :style="{ transform: 'translateY(' + knobV + 'px)' }">
@@ -85,9 +91,7 @@
             <text class="sticktitle">左右</text>
             <text class="sticknum" :class="pctClass(turnPct)">{{ signed(turnPct) }}</text>
           </view>
-          <view class="stick"
-                @touchstart="hStart" @touchmove.stop.prevent="hMove"
-                @touchend="hEnd" @touchcancel="hEnd">
+          <view class="stick" id="stickH">
             <view class="axis-h"></view>
             <view class="knob" :class="{ snap: snapH }"
                   :style="{ transform: 'translateX(' + knobH + 'px)' }">
@@ -98,7 +102,7 @@
       </view>
 
       <text class="sticktip">
-        按住杆拖动，松手自动回中 → 原地停 · 小车收到 前 {{ signed(cmdFwd) }} 转 {{ signed(cmdTurn) }}
+        两根杆可以同时推（各用一根手指）· 松手自动回中 → 原地停 · 车收到 前 {{ signed(cmdFwd) }} 转 {{ signed(cmdTurn) }}<text v-if="touchN" class="touchbadge"> · 触点 {{ touchN }}</text>
       </text>
 
       <!-- 动作 -->
@@ -185,6 +189,7 @@
 <script>
 import SPP from '@/common/spp.js'
 import { CMD, buildMove, buildSet, buildSetv, buildSett, parseLine, BST_STATES } from '@/common/protocol.js'
+import { stepRange } from '@/common/chart.js'
 
 const WAVE_N = 240
 const STATE_NAMES = { 0: 'IDLE', 1: 'CAL', 2: 'RUN', 3: 'FAULT' }
@@ -205,6 +210,7 @@ export default {
       // 行驶：双杆，每轴 -1..1（0 = 中位 = 原地停住）
       pct: 40,
       stick: { v: 0, h: 0 },
+      touchN: 0,            // 当前手指个数，用来确认手机确实报了多指
       snapV: true,          // true 时手柄带弹回动画，拖动时关掉避免延迟
       snapH: true,
       knobMax: 40,          // px，onLoad 里按 90rpx 换算
@@ -231,7 +237,8 @@ export default {
 
       // 波形
       cw: 320, ch: 170,
-      wa: [], wt: []
+      wa: [], wt: [],
+      range: 0,             // 波形纵轴量程 ±range 度，按这一窗数据的峰值自动算
     }
   },
 
@@ -256,13 +263,20 @@ export default {
     this.ch = Math.floor(Math.min(200, this.cw * 0.52))
     // 手柄最大位移 86rpx → px（与 .stick 260rpx / .knob 88rpx 的边距一致）
     this.knobMax = Math.max(28, Math.floor(si.windowWidth / 750 * 86))
+    // 手指 identifier → 管哪根杆。非响应式，只给手势层用
+    this._grab = {}
+    this._rectV = null
+    this._rectH = null
     try {
       const saved = uni.getStorageSync('bc_presets')
       if (Array.isArray(saved)) { this.presets = saved }
     } catch (e) { /* ignore */ }
   },
 
-  onReady() { this.drawWave() },
+  onReady() {
+    this.drawWave()
+    this.measureSticks()          // 双杆的屏幕位置，手势判定要用
+  },
   onShow() { if (this.connected) { this.startLoops() } },
 
   onHide() { this.stopAll() },
@@ -459,58 +473,97 @@ export default {
     signed(n) { return (n > 0 ? '+' : '') + n + '%' },
     pctClass(n) { return n > 0 ? 'pos' : (n < 0 ? 'neg' : '') },
 
-    touchPos(e) {
-      const t = (e.changedTouches && e.changedTouches[0]) ||
-                (e.touches && e.touches[0])
-      return t ? { x: t.clientX, y: t.clientY } : null
+    /* ---------------- 双杆手势 ---------------- */
+    /* 一根手指管一根杆，用 identifier 绑定，全部触点在容器上拿。
+       这样两根手指同时推不会互相顶掉，手指从杆上滑出去也不断。 */
+
+    measureSticks() {
+      // 拿不到矩形就一根杆都推不动，所以查两次：先按页面实例查，
+      // 少数机型上 .in(this) 查不到就退回页面级查询
+      const grab = res => {
+        if (res && res[0] && res[1] && res[0].width > 0 && res[1].width > 0) {
+          this._rectV = res[0]
+          this._rectH = res[1]
+          return true
+        }
+        return false
+      }
+      const q = uni.createSelectorQuery().in(this)
+      q.select('#stickV').boundingClientRect()
+      q.select('#stickH').boundingClientRect()
+      q.exec(res => {
+        if (grab(res)) { return }
+        const q2 = uni.createSelectorQuery()
+        q2.select('#stickV').boundingClientRect()
+        q2.select('#stickH').boundingClientRect()
+        q2.exec(grab)
+      })
     },
 
-    vStart(e) {
+    /* 手指算不算落在杆上。y 往上放宽 48px：按在「前后」标题上也算，
+       免得用户按偏一点点就没反应；左右各放宽 8px 接住边缘。 */
+    hitAxis(x, y, rc) {
+      if (!rc) { return false }
+      return x >= rc.left - 8 && x <= rc.left + rc.width + 8 &&
+             y >= rc.top - 48 && y <= rc.top + rc.height + 12
+    },
+
+    touchId(t) { return t.identifier === undefined ? 0 : t.identifier },
+
+    sticksStart(e) {
       if (!this.connected) { return this.needConn() }
-      const p = this.touchPos(e)
-      if (!p) { return }
-      this._dragV = { y0: p.y, v0: this.stick.v }
-      this.snapV = false
+      if (!this._rectV || !this._rectH) { this.measureSticks() }
+      const list = e.changedTouches || e.touches || []
+      this.touchN = (e.touches || list).length
+      let took = false
+      for (let i = 0; i < list.length; i++) {
+        const t = list[i]
+        const id = this.touchId(t)
+        if (this._grab[id]) { continue }            // 这根手指已经绑过了
+        if (this.hitAxis(t.clientX, t.clientY, this._rectV)) {
+          this._grab[id] = { axis: 'v', y0: t.clientY, v0: this.stick.v }
+          this.snapV = false
+          took = true
+        } else if (this.hitAxis(t.clientX, t.clientY, this._rectH)) {
+          this._grab[id] = { axis: 'h', x0: t.clientX, h0: this.stick.h }
+          this.snapH = false
+          took = true
+        }
+      }
+      if (took) { try { uni.vibrateShort() } catch (err) { /* ignore */ } }
     },
 
-    vMove(e) {
-      if (!this._dragV || !this.connected) { return }
-      const p = this.touchPos(e)
-      if (!p) { return }
-      // 向上拖 = 前进：屏幕 Y 向下为正，所以取负
-      this.stick.v = this.clamp1(this._dragV.v0 - (p.y - this._dragV.y0) / this.knobMax)
-      this.throttleSend()
+    sticksMove(e) {
+      const list = e.changedTouches || e.touches || []
+      this.touchN = (e.touches || list).length
+      let moved = false
+      for (let i = 0; i < list.length; i++) {
+        const t = list[i]
+        const g = this._grab[this.touchId(t)]
+        if (!g) { continue }
+        if (g.axis === 'v') {
+          // 向上拖 = 前进：屏幕 Y 向下为正，所以取负
+          this.stick.v = this.clamp1(g.v0 - (t.clientY - g.y0) / this.knobMax)
+        } else {
+          this.stick.h = this.clamp1(g.h0 + (t.clientX - g.x0) / this.knobMax)
+        }
+        moved = true
+      }
+      if (moved) { this.throttleSend() }
     },
 
-    vEnd() {
-      if (!this._dragV) { return }
-      this._dragV = null
-      this.stick.v = 0
-      this.snapV = true
-      this.pushMove()
-    },
-
-    hStart(e) {
-      if (!this.connected) { return this.needConn() }
-      const p = this.touchPos(e)
-      if (!p) { return }
-      this._dragH = { x0: p.x, h0: this.stick.h }
-      this.snapH = false
-    },
-
-    hMove(e) {
-      if (!this._dragH || !this.connected) { return }
-      const p = this.touchPos(e)
-      if (!p) { return }
-      this.stick.h = this.clamp1(this._dragH.h0 + (p.x - this._dragH.x0) / this.knobMax)
-      this.throttleSend()
-    },
-
-    hEnd() {
-      if (!this._dragH) { return }
-      this._dragH = null
-      this.stick.h = 0
-      this.snapH = true
+    /* 只抬一根手指时，另一根杆保持不动 */
+    sticksEnd(e) {
+      const list = e.changedTouches || e.touches || []
+      this.touchN = (e.touches || []).length
+      for (let i = 0; i < list.length; i++) {
+        const id = this.touchId(list[i])
+        const g = this._grab[id]
+        if (!g) { continue }
+        delete this._grab[id]
+        if (g.axis === 'v') { this.stick.v = 0; this.snapV = true }
+        else { this.stick.h = 0; this.snapH = true }
+      }
       this.pushMove()
     },
 
@@ -523,8 +576,8 @@ export default {
     resetStick() {
       this.stick.v = 0
       this.stick.h = 0
-      this._dragV = null
-      this._dragH = null
+      this._grab = {}
+      this.touchN = 0
       this.snapV = true
       this.snapH = true
     },
@@ -733,6 +786,18 @@ export default {
       const w = this.cw
       const h = this.ch
       const ctx = uni.createCanvasContext('wave', this)
+
+      // 这一窗的峰值（角度和目标角一起看，两条曲线都不会出框）
+      let peak = 0
+      for (let i = 0; i < this.wa.length; i++) {
+        const a = Math.abs(this.wa[i]); if (a > peak) { peak = a }
+      }
+      for (let i = 0; i < this.wt.length; i++) {
+        const a = Math.abs(this.wt[i]); if (a > peak) { peak = a }
+      }
+      // 量程自动放大/缩小，带迟滞（见 common/chart.js）
+      this.range = stepRange(this.range, peak)
+
       ctx.setFillStyle('#0f1720')
       ctx.fillRect(0, 0, w, h)
 
@@ -745,7 +810,8 @@ export default {
       ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke()
 
       const mid = h / 2
-      const scale = (h / 2 - 4) / 25      // ±25°
+      const top = this.range
+      const scale = (h / 2 - 4) / top
       const series = (arr, color) => {
         if (arr.length < 2) { return }
         ctx.setStrokeStyle(color)
@@ -754,7 +820,7 @@ export default {
         for (let i = 0; i < arr.length; i++) {
           const x = w * i / (WAVE_N - 1)
           let v = arr[i]
-          if (v > 25) { v = 25 } else if (v < -25) { v = -25 }
+          if (v > top) { v = top } else if (v < -top) { v = -top }
           const y = mid - v * scale
           if (i === 0) { ctx.moveTo(x, y) } else { ctx.lineTo(x, y) }
         }
@@ -763,9 +829,13 @@ export default {
       series(this.wt, '#2b8a3e')
       series(this.wa, '#e03131')
 
+      // 纵轴刻度：上下边界 + 一半
       ctx.setFontSize(10)
       ctx.setFillStyle('#5c6f85')
-      ctx.fillText('±25°', 4, 12)
+      const fmt = n => (Math.abs(n) < 10 && n % 1 !== 0) ? n.toFixed(1) : String(n)
+      ctx.fillText('+' + fmt(top), 4, 11)
+      ctx.fillText('0', 4, mid + 4)
+      ctx.fillText('-' + fmt(top), 4, h - 3)
       ctx.setFillStyle('#e03131'); ctx.fillText('角度', w - 52, 12)
       ctx.setFillStyle('#2b8a3e'); ctx.fillText('目标', w - 26, 12)
       ctx.draw()
@@ -932,6 +1002,7 @@ export default {
   line-height: 1.5;
   margin-top: 8rpx;
 }
+.touchbadge { color: #4dabf7; font-weight: 600; }
 
 .acts-row { display: flex; margin-top: 10rpx; }
 .act {
