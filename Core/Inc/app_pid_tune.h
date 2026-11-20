@@ -10,6 +10,8 @@
  *   PC  -> MCU : GET / SET,<kp100>,<ki100>,<kd100>   angle-loop gains
  *                GETV / SETV,<kp10000>,<ki10000>     speed-loop gains
  *                GETT / SETT,<kp100>,<ki100>         turn-loop gains (PI)
+ *                SAVE                write the current gains to flash; they
+ *                                    are restored automatically at boot
  *                CAL                 zero-offset capture (hold car still)
  *                BAL,<0|1>           disable / enable the balance loop
  *                BST                 balance status snapshot

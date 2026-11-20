@@ -16,6 +16,7 @@
  */
 #include "app_pid_tune.h"
 #include "app_balance.h"
+#include "bsp_flash_params.h"
 #include "bsp_hc05.h"
 #include <stdio.h>
 #include <string.h>
@@ -124,6 +125,34 @@ static void HandleLine(char *line)
   {
     App_Balance_GetTurnGains(&s_params.kt_p100, &s_params.kt_i100);
     SendAckTurn();
+    return;
+  }
+  if (strcmp(line, "SAVE") == 0)
+  {
+    ParamsStore_Gains_t g;
+    AppBalance_Status_t st;
+
+    /* A page erase stalls the CPU for tens of ms - never with motors on. */
+    App_Balance_GetStatus(&st);
+    if ((st.state == APP_BAL_STATE_RUN) || (st.state == APP_BAL_STATE_CAL))
+    {
+      SendErr("SAVE rejected - BAL,0 first");
+      return;
+    }
+    /* s_params is the exact integer copy of what was last sent, so a
+     * save/restore round trip reproduces the very same gains. */
+    g.kp100 = s_params.kp100;       g.ki100 = s_params.ki100;
+    g.kd100 = s_params.kd100;       g.kvp10000 = s_params.kv_p10000;
+    g.kvi10000 = s_params.kv_i10000;
+    g.ktp100 = s_params.kt_p100;    g.kti100 = s_params.kt_i100;
+    if (ParamsStore_Save(&g) != 0U)
+    {
+      SendLine("LOG,Params saved to flash - survives power off");
+    }
+    else
+    {
+      SendErr("SAVE flash write failed");
+    }
     return;
   }
   if (strncmp(line, "SET,", 4U) == 0)
@@ -330,6 +359,23 @@ void App_PIDTune_Init(void)
   App_Balance_SetGains(s_params.kp100, s_params.ki100, s_params.kd100);
   App_Balance_SetSpeedGains(s_params.kv_p10000, s_params.kv_i10000);
   App_Balance_SetTurnGains(s_params.kt_p100, s_params.kt_i100);
+  /* A previously SAVEd record wins over the factory defaults below. */
+  {
+    ParamsStore_Gains_t g;
+
+    if (ParamsStore_Load(&g) != 0U)
+    {
+      s_params.kp100 = g.kp100;         s_params.ki100 = g.ki100;
+      s_params.kd100 = g.kd100;         s_params.kv_p10000 = g.kvp10000;
+      s_params.kv_i10000 = g.kvi10000;
+      s_params.kt_p100 = g.ktp100;      s_params.kt_i100 = g.kti100;
+      App_Balance_SetGains(s_params.kp100, s_params.ki100, s_params.kd100);
+      App_Balance_SetSpeedGains(s_params.kv_p10000, s_params.kv_i10000);
+      App_Balance_SetTurnGains(s_params.kt_p100, s_params.kt_i100);
+      SendLine("LOG,Params restored from flash (SAVE updates it)");
+      return;
+    }
+  }
   SendLine("LOG,PID tuner ready (3-loop, on-car tuned) - CAL then BAL,1 to move");
 }
 

@@ -541,6 +541,11 @@ class PIDTuner:
                    command=self._three_loop_preset).grid(
                        row=nrows + 3, column=0, columnspan=3,
                        sticky="ew", pady=(8, 0))
+        # 把当前 7 项增益写入小车 Flash（SAVE）：断电不丢，下次上电自动恢复。
+        ttk.Button(pidf, text="保存到小车（断电不丢）",
+                   command=self._save_params).grid(
+                       row=nrows + 4, column=0, columnspan=3,
+                       sticky="ew", pady=(4, 0))
 
         # ---- Parameter snapshots (存档) ----
         pf = ttk.LabelFrame(left, text="参数存档（保存好参数，随时载入/对比）",
@@ -946,6 +951,12 @@ class PIDTuner:
             self._send_raw(cmd, cmd.decode("ascii").strip())
         self.ack_var.set("查询中，等待 ACK / ACKV / ACKT ...")
 
+    def _save_params(self):
+        """SAVE writes the current gains into the car's flash (survives off)."""
+        if self._motor_cmd("SAVE\n", "SAVE"):
+            self.ack_var.set("保存中…（运行中固件会拒绝，先急停）")
+            self._mark_event("点击 保存到小车 SAVE")
+
     def _three_loop_preset(self):
         """恢复实车调出的参考参数（已固化进固件），并同步滑块后立即下发。"""
         presets = {"kp": "3.30", "ki": "0.15", "kd": "3.00",
@@ -1125,7 +1136,8 @@ class PIDTuner:
             "50 ms 速度/转向环；CAL 后角度自动清零。\n"
             "\n"
             "PC -> 小车: SET/SETV/SETT 下发三组增益；GET/GETV/GETT 读取；\n"
-            "            CAL 扶正标定；BAL,1/BAL,0 使能/急停；BST 查状态。\n"
+            "            SAVE 存入小车 Flash(断电不丢)；CAL 扶正标定；\n"
+            "            BAL,1/BAL,0 使能/急停；BST 查状态。\n"
             "小车 -> PC: ACK/ACKV/ACKT/LOG；BST 状态；T 遥测(25 帧/秒)。\n"
             "\n"
             "固定参数(不在链路上改): 目标速度/差速=0，角度微调=0，\n"

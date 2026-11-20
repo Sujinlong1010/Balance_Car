@@ -49,6 +49,12 @@ python Tools/PID_Tuner/pid_tuner.py
 `presets.json`（随仓库备份）。可一键「载入并下发」或「仅填入不发送」，
 也能「导出对比CSV」横向比较各版本参数。
 
+**掉电保存**：点「保存到小车（断电不丢）」会把当前 7 项增益通过 `SAVE` 命令
+写入小车片内 Flash 最后一页（`bsp_flash_params.c`，magic+CRC 校验），每次上电
+自动恢复。运行中保存会被固件拒绝（页擦除会卡住 CPU 约 30 ms），先急停再存。
+擦写寿命约 1 万次，供偶尔保存足够；想回到出厂参考值，点「恢复参考值」后再点
+一次「保存到小车」覆盖即可。
+
 ## 烧录
 
 用 Keil 打开 `MDK-ARM/Balance_Car.uvprojx` 编译，或直接烧录 `MDK-ARM/Balance_Car/Balance_Car.hex`。
