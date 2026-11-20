@@ -1,31 +1,24 @@
 /* app_pid_tune.h - HC-05 wireless PID tuning protocol (application layer)
  *
+ * Only runtime-tunable items and core balance commands cross the link.
+ * Everything else (target speed/turn, angle trim, output sign, fault
+ * protection, deadband, motor polarity, encoder direction, wheel trim) is
+ * fixed in firmware constants and is NOT tunable over the air.
+ *
  * ASCII, LF terminated, x100 fixed point (gains noted otherwise).
  * No float printf on the MCU.
- *   PC  -> MCU : PING
- *                GET / SET,<kp100>,<ki100>,<kd100>   angle-loop gains
+ *   PC  -> MCU : GET / SET,<kp100>,<ki100>,<kd100>   angle-loop gains
  *                GETV / SETV,<kp10000>,<ki10000>     speed-loop gains
  *                GETT / SETT,<kp100>,<ki100>         turn-loop gains (PI)
- *                SPD,<rps100>        target speed, x100 motor-shaft rev/s
- *                YAWSP,<dif100>      target differential speed, x100 rev/s
  *                CAL                 zero-offset capture (hold car still)
  *                BAL,<0|1>           disable / enable the balance loop
  *                BST                 balance status snapshot
- *                POL,<0|1>,<0|1>     invert left / right wheel
- *                TRIM,<l%>,<r%>      per-wheel power compensation
- *                SIGN,<1|-1>         flip angle-loop output direction
- *                PROT,<0|1>          50 deg tilt cut-off
- *                YAWZERO / RSTI      heading reset / clear speed integral
- *                ENC / ENCZ          read / zero both encoders
- *                ENCS,<l>,<r>        invert encoder direction at runtime
- *   MCU -> PC  : PONG
- *                ACK,<kp100>,<ki100>,<kd100>
+ *   MCU -> PC  : ACK,<kp100>,<ki100>,<kd100>
  *                ACKV,<kp10000>,<ki10000>
- *                ACKT,<kp100>,<kd100>
+ *                ACKT,<kp100>,<ki100>
  *                LOG,<text>
  *                BST,<state>,<angle100>,<offset100>,<duty>,
  *                    <p100>,<i100>,<d100>,<cal_progress>,<vel100>,<turn>
- *                ENC,<left_ticks>,<right_ticks>,<left_tps>,<right_tps>
  *                T,<ms>,<angle100>,<target100>,<p100>,<i100>,<d100>,
  *                  <pwm100>,<vel100>,<turn>,<enc_tps>,<gyroz100>
  *
@@ -58,29 +51,19 @@
 #define PIDTUNE_DEFAULT_KP100     330L     /* 3.30 */
 #define PIDTUNE_DEFAULT_KI100     15L      /* 0.15 */
 #define PIDTUNE_DEFAULT_KD100     300L     /* 3.00 */
-#define PIDTUNE_DEFAULT_TARGET100 0L
 
 #define PIDTUNE_PARAM_LIMIT       1000000L    /* +/- 10000.00 for KP/KI/KD */
 #define PIDTUNE_SPEED_LIMIT       1000000L    /* x10000: +/- 100.0000 */
-#define PIDTUNE_TARGET_LIMIT      3000L       /* +/- 30.00 deg angle trim */
-/* SPD is the target motor-shaft speed in x100 rev/s (tutorial joystick LV/25
- * yields +/-5.00 rev/s). */
-#define PIDTUNE_SPEED_PULSE_LIMIT 500L
-/* YAWSP is the target differential speed in x100 rev/s (Left-Right). */
-#define PIDTUNE_RC_LIMIT          500L
-/* OFFSET is the deadband compensation in PWM counts (7200 = full scale). */
-#define PIDTUNE_OFFSET_LIMIT      1000L
 
 typedef struct
 {
   int32_t kp100;       /* angle loop, x100 */
-  int32_t ki100;       /* angle loop, x100 (reserved, not used) */
+  int32_t ki100;       /* angle loop, x100 */
   int32_t kd100;       /* angle loop, x100 */
-  int32_t target100;   /* operator angle trim, x100 deg */
   int32_t kv_p10000;   /* speed loop P, x10000 */
   int32_t kv_i10000;   /* speed loop I, x10000 */
   int32_t kt_p100;     /* turn loop P, x100 (encoder difference PI) */
-  int32_t kt_i100;     /* turn loop I, x100 (was kt_d100 / gyro-Z damping) */
+  int32_t kt_i100;     /* turn loop I, x100 */
 } PIDTune_Params_t;
 
 /* Call once after HC05_Init(). Sends a LOG banner over the Bluetooth link. */

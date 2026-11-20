@@ -6,20 +6,16 @@ No matplotlib/numpy: curves are drawn directly on a tkinter Canvas.
 
 Wire protocol (ASCII, LF terminated, x100 fixed point on MCU, no float printf):
   PC  -> MCU : SET,<kp*100>,<ki*100>,<kd*100>   角度环
-               SETV,<kp*10000>,<ki*10000>       速度环 (-0.20 -> -2000)
+               SETV,<kp*10000>,<ki*10000>       速度环
                SETT,<kp*100>,<ki*100>           转向环差速 PI
-               SPD,<rps*100>  YAWSP,<rps*100>  目标轴速 / 目标差速
-               GET / GETV / GETT / GETO  读取四组参数
-               OFFSET,<counts>  电机死区补偿   PERF  控制循环周期
-               PING   TARGET   YAWZERO   RSTI   CAL   BAL,<0|1>   BST
-               POL,<l>,<r>   TRIM,<l%>,<r%>   SIGN,<1|-1>   PROT,<0|1>
-               ENC   ENCZ   ENCS,<l>,<r>  编码器读/清零/方向反转
-  MCU -> PC  : PONG   ACK,..   ACKV,..   ACKT,..   ACKO,..   LOG,<text>
-               PERF,<avg_us>,<peak_us>
+               GET / GETV / GETT                读取三组增益
+               CAL   BAL,<0|1>   BST
+  MCU -> PC  : ACK,..   ACKV,..   ACKT,..   LOG,<text>
                BST,<state>,<angle>,<offset>,<duty>,P,I,D,<cal%>,<vel>,<turn>
-               ENC,<left_ticks>,<right_ticks>,<left_tps>,<right_tps>
                T,<ms>,<angle>,<target>,P,I,D,<pwm>,<vel>,<turn>,<enc_tps>,<gyroz>
                其中 vel/turn/enc_tps/gyroz 已按各自单位换算，PWM 为原始占空比
+  目标速度/差速、角度微调、死区、输出方向、保护、电机极性、编码器方向、轮动力
+  补偿均已固化在固件常量中，不再通过上位机下发。
   Motors stay OFF on power-up: hold upright -> CAL -> BAL,1. BAL,0 = stop.
 
 Double-click "启动PID调试助手.bat" or the desktop shortcut to launch.
@@ -152,32 +148,6 @@ def parse_ack_t(line):
         return None
 
 
-def parse_ack_o(line):
-    """'ACKO,216' -> 216 (deadband counts), or None."""
-    if not line.startswith("ACKO,"):
-        return None
-    parts = line.split(",")
-    if len(parts) != 2:
-        return None
-    try:
-        return int(parts[1])
-    except ValueError:
-        return None
-
-
-def parse_perf(line):
-    """'PERF,5000,5310' -> (5000, 5310) in microseconds, or None."""
-    if not line.startswith("PERF,"):
-        return None
-    parts = line.split(",")
-    if len(parts) != 3:
-        return None
-    try:
-        return (int(parts[1]), int(parts[2]))
-    except ValueError:
-        return None
-
-
 def parse_telemetry(line):
     """'T,<ms>,<a>,<t>,<p>,<i>,<d>,<pwm>[,<vel>,<turn>,<enc>,<gyroz>]'."""
     if not line.startswith("T,"):
@@ -212,11 +182,6 @@ def _selftest():
     assert parse_ack("ACK,1250,80,4500") == (12.5, 0.8, 45.0)
     assert parse_ack_v("ACKV,20000,500") == (2.0, 0.05)
     assert parse_ack_t("ACKT,400,300") == (4.0, 3.0)
-    assert parse_ack_o("ACKO,216") == 216
-    assert parse_ack_o("ACKO,x") is None
-    assert parse_ack_o("ACK,1,2,3") is None
-    assert parse_perf("PERF,5000,5310") == (5000, 5310)
-    assert parse_perf("PERF,5000") is None
     assert parse_ack("LOG,hello") is None
     t = parse_telemetry("T,1000,1250,0,120,30,-40,3500,-150,25,600,0")
     assert t is not None
@@ -320,13 +285,8 @@ class PIDTuner:
         )
         self.slider_vars = {}
         self._last_live_send = {}
-        # 电机死区补偿（PWM counts，7200 = 100% 占空比）。216 = 3% 占空比。
+        # 死区补偿已固化进固件（216 counts = 3%）；此变量仅用于参数存档快照。
         self.deadband_var = tk.StringVar(value="216")
-        self.perf_var = tk.StringVar(value="循环 --")
-        # 本车实测：左轮前进计数为正、右轮为负 → 固件默认已把右轮取反。
-        # 这里默认勾选以保持一致，避免一打开就误判成"没生效"。
-        self.enc_inv_l = tk.BooleanVar(value=False)
-        self.enc_inv_r = tk.BooleanVar(value=True)
         self.ch_vars = {ch: tk.BooleanVar(value=(ch in ("angle", "target", "pwm")))
                         for ch, _, _ in CHANNELS}
         self.window_var = tk.StringVar(value="10")
@@ -338,15 +298,8 @@ class PIDTuner:
         self.auto_scroll = tk.BooleanVar(value=True)
         self.show_ts = tk.BooleanVar(value=True)
         self.demo = tk.BooleanVar(value=False)
-        self.inv_l = tk.BooleanVar(value=False)
-        self.inv_r = tk.BooleanVar(value=False)
-        self.trim_l = tk.StringVar(value="100")
-        self.trim_r = tk.StringVar(value="100")
-        self.prot_var = tk.BooleanVar(value=True)
         self.motor_state = tk.StringVar(value="IDLE · 电机停")
         self.bal_state = tk.StringVar(value="state --")
-        self.enc_state = tk.StringVar(value="编码器 --")
-        self.auto_enc = tk.BooleanVar(value=True)
 
         self.ser = None
         self.reader = None
@@ -376,7 +329,7 @@ class PIDTuner:
         self._demo_integral = 0.0
         self._demo_deriv = 0.0
         self._demo_ms = 0
-        self._last_enc_query = 0.0
+        self._last_bst_query = 0.0
 
         self._build_ui()
         self._refresh_ports()
@@ -584,22 +537,9 @@ class PIDTuner:
                   foreground="#0c8599").grid(
                       row=nrows + 2, column=0, columnspan=3,
                       sticky="w", pady=(4, 0))
-        # 电机死区补偿：江科大 OutOffset=3 (%)，对应 216 counts。
-        ttk.Label(pidf, text="死区补偿").grid(
-            row=nrows + 3, column=0, sticky="w", pady=(6, 2))
-        ttk.Entry(pidf, textvariable=self.deadband_var, width=9,
-                  font=MONO).grid(row=nrows + 3, column=1,
-                                  sticky="e", pady=(6, 2))
-        ttk.Button(pidf, text="下发死区", command=self._send_deadband).grid(
-            row=nrows + 3, column=2, sticky="ew", pady=(6, 2), padx=(4, 0))
-        ttk.Button(pidf, text="测循环周期", command=self._query_perf).grid(
-            row=nrows + 4, column=0, columnspan=2, sticky="ew", pady=(2, 2), padx=(0, 3))
-        ttk.Label(pidf, textvariable=self.perf_var,
-                  foreground="#0c8599").grid(
-                      row=nrows + 4, column=2, sticky="w", pady=(2, 0))
         ttk.Button(pidf, text="恢复参考值（推荐）",
                    command=self._three_loop_preset).grid(
-                       row=nrows + 5, column=0, columnspan=3,
+                       row=nrows + 3, column=0, columnspan=3,
                        sticky="ew", pady=(8, 0))
 
         # ---- Parameter snapshots (存档) ----
@@ -669,39 +609,6 @@ class PIDTuner:
         ttk.Button(row1, text="导出 CSV", command=self._export_csv).pack(
             side="left", expand=True, fill="x", padx=2)
 
-        cmdf = ttk.LabelFrame(left, text="快捷命令", padding=8)
-        cmdf.pack(fill="x", pady=6)
-        ttk.Button(cmdf, text="PING 链路测试", command=self._ping).pack(fill="x", pady=2)
-        ttk.Button(cmdf, text="GET 查询参数", command=self._query_pid).pack(fill="x", pady=2)
-        ttk.Button(cmdf, text="TARGET 0 / YAWZERO", command=self._send_aux).pack(fill="x", pady=2)
-        ttk.Button(cmdf, text="协议帮助", command=self._show_help).pack(fill="x", pady=2)
-        trim_row = ttk.Frame(cmdf)
-        trim_row.pack(fill="x", pady=(6, 2))
-        ttk.Label(trim_row, text="轮动力补偿%").pack(side="left")
-        ttk.Entry(trim_row, textvariable=self.trim_l, width=4).pack(side="left", padx=2)
-        ttk.Label(trim_row, text="/").pack(side="left")
-        ttk.Entry(trim_row, textvariable=self.trim_r, width=4).pack(side="left", padx=2)
-        ttk.Button(trim_row, text="下发", command=self._send_trim).pack(side="left", padx=4)
-        sign_row = ttk.Frame(cmdf)
-        sign_row.pack(fill="x", pady=(4, 2))
-        ttk.Label(sign_row, text="方向").pack(side="left")
-        ttk.Button(sign_row, text="SIGN,1",
-                   command=lambda: self._send_sign(1)).pack(side="left", padx=2)
-        ttk.Button(sign_row, text="SIGN,-1",
-                   command=lambda: self._send_sign(-1)).pack(side="left", padx=2)
-        enc_row = ttk.Frame(cmdf)
-        enc_row.pack(fill="x", pady=(4, 2))
-        ttk.Label(enc_row, text="编码器方向").pack(side="left")
-        ttk.Checkbutton(enc_row, text="左反", variable=self.enc_inv_l,
-                        command=self._send_enc_sign).pack(side="left", padx=2)
-        ttk.Checkbutton(enc_row, text="右反", variable=self.enc_inv_r,
-                        command=self._send_enc_sign).pack(side="left", padx=2)
-        ttk.Checkbutton(cmdf, text="50° 保护（相对目标角，默认开）",
-                        variable=self.prot_var,
-                        command=self._toggle_prot).pack(fill="x", pady=(2, 2))
-        ttk.Checkbutton(cmdf, text="演示数据（无需硬件）", variable=self.demo,
-                        command=self._on_demo_toggle).pack(fill="x", pady=(6, 2))
-
         right = ttk.Frame(main)
         right.grid(row=0, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
@@ -731,22 +638,11 @@ class PIDTuner:
         ttk.Button(mb, text="① 扶正标定 CAL", command=self._bal_cal).pack(side="left", padx=(2, 2))
         ttk.Button(mb, text="② 开始平衡", command=self._bal_on).pack(side="left", padx=2)
         ttk.Button(mb, text="急停 BAL,0", command=self._bal_off).pack(side="left", padx=2)
-        ttk.Button(mb, text="清零积分", command=self._bal_rsti).pack(side="left", padx=2)
         ttk.Button(mb, text="状态", command=self._bal_query).pack(side="left", padx=2)
         ttk.Label(mb, textvariable=self.motor_state,
                   foreground="#0c8599").pack(side="left", padx=(8, 0))
         ttk.Label(mb, textvariable=self.bal_state, font=MONO,
                   foreground="#495057").pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(mb, text="左轮反转", variable=self.inv_l,
-                        command=self._motor_pol).pack(side="left", padx=(12, 2))
-        ttk.Checkbutton(mb, text="右轮反转", variable=self.inv_r,
-                        command=self._motor_pol).pack(side="left", padx=2)
-        ttk.Checkbutton(mb, text="自动读编码器",
-                        variable=self.auto_enc).pack(side="left", padx=(12, 2))
-        ttk.Label(mb, textvariable=self.enc_state, font=MONO,
-                  foreground="#9c36b5").pack(side="left", padx=(4, 0))
-        ttk.Button(mb, text="清零",
-                   command=self._enc_zero).pack(side="left", padx=(6, 2))
 
         txf = ttk.Frame(self.root, padding=(8, 4, 8, 8))
         txf.grid(row=4, column=0, sticky="ew")
@@ -861,13 +757,11 @@ class PIDTuner:
                 self._close_port()
         if self.demo.get():
             self._demo_tick()
-        if (self.auto_enc.get() and not self.demo.get()
-                and self.ser is not None and self.ser.is_open):
+        if not self.demo.get() and self.ser is not None and self.ser.is_open:
             now_t = time.monotonic()
-            if (now_t - self._last_enc_query) >= 0.5:
-                self._last_enc_query = now_t
+            if (now_t - self._last_bst_query) >= 0.5:
+                self._last_bst_query = now_t
                 try:
-                    self.ser.write(b"ENC\n")   # silent: no RX-area spam
                     self.ser.write(b"BST\n")   # track RUN / FAULT transitions
                 except Exception:
                     pass
@@ -960,16 +854,6 @@ class PIDTuner:
             self._refresh_active_params()
             self.ack_var.set("转向环已同步 (ACKT)")
             return
-        ack_o = parse_ack_o(line)
-        if ack_o is not None:
-            self.deadband_var.set("%d" % ack_o)
-            self.ack_var.set("死区补偿 %d counts (ACKO)" % ack_o)
-            return
-        perf = parse_perf(line)
-        if perf is not None:
-            self.perf_var.set("循环 平均 %.2f ms / 峰值 %.2f ms"
-                              % (perf[0] / 1000.0, perf[1] / 1000.0))
-            return
         b = parse_bst(line)
         if b is not None:
             name = BST_STATES.get(b["state"], "?")
@@ -989,18 +873,6 @@ class PIDTuner:
             else:
                 self.motor_state.set("IDLE · 电机停")
             return
-        if line.startswith("ENC,"):
-            parts = line.split(",")
-            if len(parts) == 5:
-                try:
-                    lc, rc, ls, rs = (int(x) for x in parts[1:])
-                except ValueError:
-                    return
-                self.enc_state.set("L %+d / R %+d  |  %+d / %+d tick/s"
-                                   % (lc, rc, ls, rs))
-            return
-        if line.startswith("PONG"):
-            self._log("[PONG] 蓝牙链路正常\n")
 
     # ------------------------------------------------------------------ send
     def _send_raw(self, data, echo):
@@ -1059,8 +931,7 @@ class PIDTuner:
             return
         frames = (build_set_command(kp, ki, kd),
                   build_setv_command(kvp, kvi),
-                  build_sett_command(ktp, kti),
-                  "SPD,0\n", "YAWSP,0\n")
+                  build_sett_command(ktp, kti))
         sent = True
         for text in frames:
             sent = self._send_raw(text.encode("ascii"),
@@ -1071,32 +942,9 @@ class PIDTuner:
                              % (kp, ki, kd, kvp, kvi, ktp, kti))
 
     def _query_pid(self):
-        for cmd in (b"GET\n", b"GETV\n", b"GETT\n", b"GETO\n"):
+        for cmd in (b"GET\n", b"GETV\n", b"GETT\n"):
             self._send_raw(cmd, cmd.decode("ascii").strip())
-        self.ack_var.set("查询中，等待 ACK / ACKV / ACKT / ACKO ...")
-
-    def _send_enc_sign(self):
-        l = 1 if self.enc_inv_l.get() else 0
-        r = 1 if self.enc_inv_r.get() else 0
-        cmd = "ENCS,%d,%d\n" % (l, r)
-        if self._motor_cmd(cmd, cmd.rstrip("\n")):
-            self._mark_event("编码器方向 %d/%d" % (l, r))
-
-    def _ping(self):
-        self._send_raw(b"PING\n", "PING")
-
-    def _toggle_prot(self):
-        """Enable/disable the 50 deg (from target) tilt cut-off."""
-        on = 1 if self.prot_var.get() else 0
-        cmd = "PROT,%d\n" % on
-        if self._motor_cmd(cmd, cmd.rstrip("\n")):
-            self._mark_event("50deg保护 %s" % ("开" if on else "关"))
-
-    def _send_sign(self, value):
-        """Flip the balance output direction live, no reflash needed."""
-        cmd = "SIGN,%d\n" % value
-        if self._motor_cmd(cmd, cmd.rstrip("\n")):
-            self._mark_event("SIGN %+d" % value)
+        self.ack_var.set("查询中，等待 ACK / ACKV / ACKT ...")
 
     def _three_loop_preset(self):
         """恢复实车调出的参考参数（已固化进固件），并同步滑块后立即下发。"""
@@ -1107,7 +955,6 @@ class PIDTuner:
             self._var_for(key).set(text)
             self._sync_slider(key)
         self.deadband_var.set("216")
-        self._send_deadband()
         self._send_pid()
 
     # ------------------------------------------------------ parameter snapshots
@@ -1179,7 +1026,7 @@ class PIDTuner:
             self.preset_status_var.set("先选中一个存档")
             return
         self._apply_snapshot(p)
-        self.preset_status_var.set("已填入「%s」，未下发（点下发全部/下发死区才生效）"
+        self.preset_status_var.set("已填入「%s」，未下发（点下发全部才生效）"
                                    % p.get("name", "?"))
 
     def _preset_load(self):
@@ -1188,7 +1035,6 @@ class PIDTuner:
             self.preset_status_var.set("先选中一个存档")
             return
         self._apply_snapshot(p)
-        self._send_deadband()
         self._send_pid()
         self.preset_status_var.set("已载入并下发「%s」" % p.get("name", "?"))
         self._log("[存档] 载入 %s" % p.get("name", "?"), timestamp=True)
@@ -1232,25 +1078,6 @@ class PIDTuner:
         except OSError as exc:
             messagebox.showerror("导出失败", str(exc))
 
-    def _send_deadband(self):
-        """Motor deadband compensation (OFFSET,<counts>; 7200 = 100% duty)."""
-        try:
-            counts = int(float(self.deadband_var.get()))
-        except ValueError:
-            messagebox.showerror("参数错误", "死区补偿必须是整数（PWM counts，0~1000）。")
-            return
-        counts = max(0, min(1000, counts))
-        self.deadband_var.set("%d" % counts)
-        cmd = "OFFSET,%d\n" % counts
-        if self._motor_cmd(cmd, cmd.rstrip("\n")):
-            self._mark_event("死区补偿 %d (%.1f%% 占空比)"
-                             % (counts, counts * 100.0 / 7200.0))
-
-    def _query_perf(self):
-        """Ask the MCU for its measured control-loop period (PERF,<avg>,<peak>)."""
-        if self._motor_cmd("PERF\n", "PERF"):
-            self.perf_var.set("查询中…（需运行满 1 秒）")
-
     # ---------------------------------------------------------------- motors
     def _motor_cmd(self, cmd, echo):
         if self.demo.get():
@@ -1288,143 +1115,26 @@ class PIDTuner:
             self.motor_state.set("IDLE · 电机停")
             self._mark_event("点击 急停 BAL,0")
 
-    def _bal_rsti(self):
-        """Clear the speed-loop integrator (must be sent after every gain change)."""
-        # Firmware answers RSTI with "LOG,All integrals reset" (angle + speed).
-        if self._motor_cmd("RSTI\n", "LOG,All"):
-            self._mark_event("点击 清零积分 RSTI")
-
     def _bal_query(self):
         self._motor_cmd("BST\n", "BST")
 
-    def _motor_pol(self):
-        left = 1 if self.inv_l.get() else 0
-        right = 1 if self.inv_r.get() else 0
-        self._motor_cmd("POL,%d,%d\n" % (left, right),
-                        "POL,%d,%d" % (left, right))
-
-    def _send_trim(self):
-        """Compensate weaker wheel: TRIM,<left%>,<right%>, 50..150."""
-        try:
-            l = int(self.trim_l.get())
-            r = int(self.trim_r.get())
-        except ValueError:
-            messagebox.showerror("参数错误", "轮动力补偿必须是 50~150 的整数。")
-            return
-        if not ((50 <= l <= 150) and (50 <= r <= 150)):
-            messagebox.showerror("参数错误", "轮动力补偿范围 50~150，默认 100/100。")
-            return
-        cmd = "TRIM,%d,%d\n" % (l, r)
-        if self._motor_cmd(cmd, cmd.rstrip("\n")):
-            self._mark_event("TRIM %d%% / %d%%" % (l, r))
-
-    def _enc_zero(self):
-        self._motor_cmd("ENCZ\n", "ENCZ")
-
-    def _send_aux(self):
-        if self.demo.get():
-            self._log("[演示] TARGET / YAWZERO 只对真实设备有效\n")
-            return
-        self._send_raw(b"TARGET,0\n", "TARGET,0")
-        self._send_raw(b"YAWZERO\n", "YAWZERO")
-
     def _show_help(self):
         messagebox.showinfo(
-            "通信协议 (ASCII / LF / 角度环和转向环 x100 / 速度环 x10000)",
-            "固件基于江科大教程 06 的 PID_Update 三环，参数已按实车调优并固化；DLPF 关闭，\n"
-            "10 ms 角度环 + 50 ms 速度/转向环；角度数值 CAL 后自动清零。\n"
+            "通信协议 (ASCII / LF / 三环增益 x100,x10000,x100)",
+            "固件基于江科大教程 06 三环 PID；DLPF 关闭，10 ms 角度环 +\n"
+            "50 ms 速度/转向环；CAL 后角度自动清零。\n"
             "\n"
-            "PC  -> 小车\n"
-            "  PING / GET / GETV / GETT / GETO  测试 / 查四组参数\n"
-            "  SET,<KP*100>,<KI*100>,<KD*100>   角度环 (3.30/0.15/3.00)\n"
-            "  SETV,<KP*10000>,<KI*10000>   速度环 (0.80/0.065)\n"
-            "  SETT,<KP*100>,<KI*100>       转向环编码器差速 PI (3.00/4.00)\n"
-            "  SPD,<转每秒*100>             目标轴转速，0=原地立住\n"
-            "  YAWSP,<差速转每秒*100>       左右轮差速目标，0=直行\n"
-            "  OFFSET,<counts>              电机死区补偿 0~1000（216=3% 占空比）\n"
-            "  PERF                         查控制循环周期(平均/峰值，微秒)\n"
-            "  RSTI                        清零全部积分（改增益后必发）\n"
-            "  CAL                         扶正静止时标定零位\n"
-            "  BAL,1 / BAL,0               使能 / 急停闭环\n"
-            "  BST                         查平衡状态(角度/零位/PWM/三环)\n"
-            "  POL,<0|1>,<0|1>           左/右轮极性反转\n"
-            "  TRIM,<左%>,<右%>           轮动力补偿 50~150，默认 100/100\n"
-            "  SIGN,1 / SIGN,-1           实时翻转角度环输出方向\n"
-            "  PROT,0 / PROT,1           关闭 / 开启 50° 倾倒保护\n"
-            "     以目标角(标定零位)为基准，非绝对水平\n"
-            "     IMU 失效保护始终有效，不可关闭；请手扶调试\n"
-            "  ENC / ENCZ                读 / 清零两轮编码器\n"
-            "  ENCS,<0|1>,<0|1>          左右编码器方向反转（速度环反了就点）\n"
+            "PC -> 小车: SET/SETV/SETT 下发三组增益；GET/GETV/GETT 读取；\n"
+            "            CAL 扶正标定；BAL,1/BAL,0 使能/急停；BST 查状态。\n"
+            "小车 -> PC: ACK/ACKV/ACKT/LOG；BST 状态；T 遥测(25 帧/秒)。\n"
             "\n"
-            "小车 -> PC\n"
-            "  PONG / ACK / ACKV / ACKT / ACKO / LOG,<文本>\n"
-            "  PERF,<平均us>,<峰值us>     每秒刷新一次\n"
-            "  BST,<状态>,<角度>,<零位>,<占空比>,P,I,D,进度,速度环角,转向环\n"
-            "    状态: 0=IDLE 1=CAL 2=RUN 3=FAULT\n"
-            "  ENC,<左计数>,<右计数>,<左速>,<右速>\n"
-            "  T,<ms>,<角度>,<目标>,P,I,D,<PWM>,速度环角,转向环,<编码器速度>,<偏航速率>\n"
+            "固定参数(不在链路上改): 目标速度/差速=0，角度微调=0，\n"
+            "  死区=216 counts(3%)，输出方向、50°保护、电机极性、\n"
+            "  编码器方向、轮动力补偿均为固件常量。\n"
             "\n"
-            "=== 面板上 7 个数 + 1 个死区（实车调出的参考值，已固化进固件）===\n"
-            "  角度KP=3.30  角度KI=0.15  角度KD=3.00\n"
-            "  速度KP=0.80  速度KI=0.065\n"
-            "  转向KP=3.00  转向KI=4.00  死区补偿=216 counts(=3%)\n"
-            "  ★ 运行中调参两种方式：\n"
-            "    ① 键盘 ↑/↓ 微调（推荐）：点中某行的输入框或滑块，按上下键\n"
-            "       每次只走一个细步进（角度/转向 0.01，速度KI 0.001），\n"
-            "       Shift+↑/↓ = 10 倍；Ctrl+↑/↓ = 100 倍快速大范围移动。\n"
-            "       每按一次立即下发，不用点任何按钮，比拖滑块精准得多。\n"
-            "    ② 拖滑块粗调：70 ms 节流，松手补发；输入框回车同步滑块。\n"
-            "  ★ 量程说明：教程 PWM 是 ±100，本车 TB6612 是 ±7200，\n"
-            "    固件内部按教程数值算完再 ×72，面板数值与教程同一量纲。\n"
-            "\n"
-            "=== 三个环分别管什么（串级）===\n"
-            "  角度环 10 ms：实际角 vs 目标角 -> 平均 PWM，负责\"别倒\"\n"
-            "  速度环 50 ms：平均轮速 -> 目标倾角(±20°) 串给角度环\n"
-            "  转向环 50 ms：左右轮差速 -> 差动 PWM，负责\"别自转\"\n"
-            "  所以 Target 不是平线才对：它是速度环动态给的目标倾角，\n"
-            "  静止且速度环稳定时应在 0 附近小幅圆滑波动。\n"
-            "\n"
-            "=== 调参顺序（照江科大视频）===\n"
-            "1) 角度环先调：KI=0、KD=0、速度环关(SPD,0 且 KP=0)，\n"
-            "   角度KP 从小往上加，到等幅摆动取 0.6 倍；再加 KD 压摆幅。\n"
-            "2) 角度稳了再加角度 KI(参考值 0.15)消除固定偏角；改完点 RSTI。\n"
-            "3) 最后开速度环、转向环，速度环输出会带动 Target。\n"
-            "4) 异常立刻「急停 BAL,0」，手扶着调。\n"
-            "\n"
-            "=== 参数存档（对比不同调参版本）===\n"
-            "  调出满意的参数后，在「参数存档」里输个名字点「保存当前」，\n"
-            "  会把 7 项增益 + 死区补偿存到脚本同目录的 presets.json。\n"
-            "  - 点列表某一项可看它的全部参数；\n"
-            "  - 「仅填入不发送」= 把该存档填回输入框先看看，不动小车；\n"
-            "  - 「载入并下发」= 填回并立即发给小车生效；\n"
-            "  - 「导出对比CSV」= 把所有存档导成表格，横向对比各版本参数。\n"
-            "  presets.json 跟脚本放一起，随仓库备份，换电脑拷走即可。\n"
-            "\n"
-            "=== D 项说明 ===\n"
-            "  D 项 = -Kd*(本次角度-上次角度)，是角度微分先行，\n"
-            "  吃的是互补滤波后的平滑角度，不是裸陀螺仪噪声；所以可以大。\n"
-            "  配套地把 MPU 的 DLPF 关掉换取低延迟：比起噪声更不能忍延迟。\n"
-            "\n"
-            "=== 上车步骤（务必按顺序）===\n"
-            "1) 车架空/人扶住，上电保持静止 0.5 s（固件标陀螺仪零偏）\n"
-            "2) 扶正车身 → 点「扶正标定 CAL」，等 1 秒\n"
-            "   (完成后角度立即清零：机械竖直时显示 0 度)\n"
-            "3) 点「恢复参考值（推荐）」\n"
-            "4) 点「测循环周期」，控制环应为 10 ms 一次\n"
-            "5) 点「开始平衡 BAL,1」，手别马上松\n"
-            "6) 若往一侧溜：先看 Target 是否偏；偏则调 CAL 或 TARGET 微调。\n"
-            "   若左右自转：优先查转向 KP/KI 与编码器方向（ENCS）。\n"
-            "\n"
-            "=== 导出的 CSV 列说明 ===\n"
-            "  t_s      时间 | angle 实际角 | target 目标角\n"
-            "  p/i/d    三项分项 | pwm 实际输出 (-7200..7200)\n"
-            "  vel      速度环输出(叠加到目标角) | turn 转向环\n"
-            "  enc_tps  两轮编码器速度之和 | gyroz 偏航角速度\n"
-            "  state    0=IDLE 1=CAL 2=RUN 3=FAULT\n"
-            "  offset   标定零位 | kp/ki/kd/kvp/kvi/ktp/kti 当时生效的增益\n"
-            "  参数列每帧都写，回看旧数据也知道那段用的什么参数\n"
-            "  导出时长独立设置（默认 60 秒，可手输，遥测 25 帧/秒\n"
-            "  → 60s≈1500 行）；勾「导出全部缓存」可导最长 240 秒\n"
+            "参考值: 角度 3.30/0.15/3.00，速度 0.80/0.065，转向 3.00/4.00。\n"
+            "运行中调参: 输入框/滑块 ↑↓ 微调(Shift 10x, Ctrl 100x)或拖滑块。\n"
+            "上车: 扶正静止上电 -> CAL -> 开始平衡；异常点急停 BAL,0。\n"
             "HC-05 需先配置 AT+UART=115200,0,0")
 
     def _on_demo_toggle(self):

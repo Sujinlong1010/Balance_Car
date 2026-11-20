@@ -43,14 +43,16 @@
  *  --- Commands (over HC-05, LF terminated) ---------------------------------
  *    CAL          hold upright & still; capture the centre angle and ZERO it
  *    BAL,1 / 0    enable / disable closed loop (refuses if tilted too far)
- *    SET,kp,ki,kd angle gains, x100 (5.00 -> 500, 0.10 -> 10, 5.00 -> 500)
- *    SETV,kp,ki   speed gains, x10000 (2.00 -> 20000, 0.05 -> 500)
- *    SETT,kp,ki   turn gains, x100 (4.00 -> 400, 3.00 -> 300)
- *    SPD,rps100   target speed, x100 motor-shaft rev/s (0 = hold position)
- *    YAWSP,dif100 target differential speed, x100 rev/s (0 = straight)
- *    OFFSET,n     deadband in PWM counts (216 = 3%, 0 = off)
+ *    SET,kp,ki,kd angle gains, x100 (3.30 -> 330, 0.15 -> 15, 3.00 -> 300)
+ *    SETV,kp,ki   speed gains, x10000 (0.80 -> 8000, 0.065 -> 650)
+ *    SETT,kp,ki   turn gains, x100 (3.00 -> 300, 4.00 -> 400)
+ *    GET/GETV/GETT read back the three gain groups
  *    BST / T      status / telemetry  (see app_pid_tune.h)
- *    RSTI / PERF  reset all PID states / report real loop period
+ *
+ *  Everything else is fixed in the constants below, not tunable at runtime:
+ *  target speed = target turn = angle trim = 0, output sign = APP_BAL_OUTPUT_SIGN,
+ *  50 deg protection = on, deadband = APP_BAL_ANGLE_OFFSET (3 percent = 216
+ *  counts), motor polarity / encoder direction / wheel trim = macro defaults.
  */
 #ifndef __APP_BALANCE_H
 #define __APP_BALANCE_H
@@ -81,8 +83,7 @@
 #define APP_BAL_SPEED_OUTMIN    (-20.0f)
 #define APP_BAL_SPEED_I_MAX     150.0f
 #define APP_BAL_SPEED_I_MIN     (-150.0f)
-/* Target speed ceiling: +/-5.00 rev/s (tutorial joystick LV/25 -> +/-5). */
-#define APP_BAL_SPEED_MAX_PULSE 500L     /* x100 rev/s */
+/* Target speed is fixed at 0 (hold position); no joystick in this build. */
 
 /* --- Turn loop: tuned on-car default (3.00/4.00), Kd=0, out +/-50 --------- *
  * NOTE: the tutorial's turn loop is encoder-difference PI. The old gyro-Z
@@ -93,8 +94,7 @@
 #define APP_BAL_TURN_OUTMIN     (-50.0f)
 #define APP_BAL_TURN_I_MAX      20.0f
 #define APP_BAL_TURN_I_MIN      (-20.0f)
-/* Target differential speed ceiling: +/-5.00 rev/s. */
-#define APP_BAL_TURN_RC_LIMIT   500L     /* x100 rev/s */
+/* Target differential speed is fixed at 0 (drive straight). */
 
 /* --- Encoder -> motor shaft speed, tutorial constants --------------------- *
  * LeftSpeed = Encoder_Get(1) / 44.0 / 0.05 / 9.27666; */
@@ -114,8 +114,12 @@
 /* percent-domain PID output -> real duty. 7200 / 100 = 72. */
 #define APP_BAL_PWM_LIMIT       7200
 #define APP_BAL_PWM_SCALE       72.0f
-/* Retained macro name for the protocol layer (OFFSET command, 7200=100%). */
-#define APP_BAL_DEADBAND        216
+
+/* Hardware build switch: TB6612 motor driver is fitted. CAL/BAL/BST are
+ * only meaningful (and only exposed over the link) when it is present. */
+#ifndef APP_ENABLE_TB6612
+#define APP_ENABLE_TB6612       1U
+#endif
 
 /* Direction: measured on this car: its motor wiring is opposite to the
  * reference, so outputs are inverted by default. Same as SIGN,-1 over BLE.
@@ -202,27 +206,9 @@ void    App_Balance_GetSpeedGains(int32_t *kp10000, int32_t *ki10000);
 void    App_Balance_SetTurnGains(int32_t kp100, int32_t ki100);
 void    App_Balance_GetTurnGains(int32_t *kp100, int32_t *ki100);
 
-/* Target speed / turn rate, x100 motor-shaft rev/s. */
-void    App_Balance_SetTargetSpeed(int32_t rps100);
-int32_t App_Balance_GetTargetSpeed(void);
-void    App_Balance_SetYawRate(int32_t dif100);
-int32_t App_Balance_GetYawRate(void);
-
-/* Operator angle trim, x100 deg (added on top of AnglePID.Target). */
-void    App_Balance_SetTargetOffset(int32_t target100);
-int32_t App_Balance_GetTargetOffset(void);
-
 /* Reset every PID state (Target/Actual/Error/Integral/Out), not the gains. */
 void    App_Balance_ResetIntegrals(void);
 
-void    App_Balance_SetOutputSign(int8_t sign);
-int8_t  App_Balance_GetOutputSign(void);
-void    App_Balance_SetFaultProtect(uint8_t on);
-uint8_t App_Balance_GetFaultProtect(void);
-void    App_Balance_SetDeadband(int32_t percent_x100);
-int32_t App_Balance_GetDeadband(void);
-
-void    App_Balance_GetLoopPerf(uint32_t *avg_us, uint32_t *peak_us);
 void    App_Balance_GetStatus(AppBalance_Status_t *out);
 void    App_Balance_GetImu(MPU6050_Data_t *out);
 uint8_t App_Balance_IsImuOk(void);

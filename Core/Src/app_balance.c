@@ -45,11 +45,9 @@ static int32_t s_vel100 = 0;         /* speed-loop output = target lean, x100 de
 static int32_t s_turn = 0;           /* turn-loop output in real PWM counts */
 static int32_t s_enc_tps = 0;        /* display only */
 
-static int32_t s_target_offset100 = 0L;  /* operator trim, x100 deg */
-static int32_t s_target_speed100 = 0L;   /* x100 motor-shaft rev/s */
-static int32_t s_target_turn100 = 0L;    /* x100 differential rev/s */
-static int8_t  s_output_sign = (int8_t)APP_BAL_OUTPUT_SIGN;
-static uint8_t s_fault_protect = 1U;
+/* Fixed operating point (not tunable over the air): target speed = 0,
+ * target differential = 0, operator angle trim = 0, output sign and the
+ * 50 deg cut-off come from the constants in app_balance.h. */
 
 /* Held outputs from the 50 ms loops, consumed by the 10 ms loop. */
 static float s_speed_out_hold = 0.0f;    /* deg, = SpeedPID.Out */
@@ -62,14 +60,6 @@ static int32_t s_enc_acc_r = 0L;
 /* Period dividers: 5 ms task -> 10 ms controller, 50 ms slow loops. */
 static uint8_t s_ctrl_div = 0U;
 static uint8_t s_slow_div = 0U;
-
-/* Control-loop period statistics (microseconds, for PERF). */
-static uint32_t s_perf_prev_us = 0U;
-static uint32_t s_perf_acc_us = 0U;
-static uint32_t s_perf_max_us = 0U;
-static uint32_t s_perf_n = 0U;
-static uint32_t s_perf_avg_us = 0U;
-static uint32_t s_perf_peak_us = 0U;
 
 static uint32_t s_last_us = 0U;
 static uint32_t s_last_imu_retry_ms = 0U;
@@ -249,14 +239,15 @@ static void RunSlowLoops(void)
   ave_speed = (left_rps + right_rps) * 0.5f;
   dif_speed = left_rps - right_rps;
 
-  /* Speed loop output is an ANGLE in degrees; cascade into the angle loop. */
-  s_speed_pid.Target = (float)s_target_speed100 / 100.0f;
+  /* Speed loop holds position: target speed fixed at 0. Its output is an
+   * ANGLE in degrees, cascaded into the angle loop. */
+  s_speed_pid.Target = 0.0f;
   s_speed_pid.Actual = ave_speed;
   PID_Update(&s_speed_pid);
   s_speed_out_hold = s_speed_pid.Out;
 
-  /* Turn loop is encoder DIFFERENCE PI (not gyro-Z rate damping). */
-  s_turn_pid.Target = (float)s_target_turn100 / 100.0f;
+  /* Turn loop is encoder DIFFERENCE PI, target differential fixed at 0. */
+  s_turn_pid.Target = 0.0f;
   s_turn_pid.Actual = dif_speed;
   PID_Update(&s_turn_pid);
   s_dif_pwm = (int)(s_turn_pid.Out * APP_BAL_PWM_SCALE);
@@ -271,11 +262,10 @@ static void RunAngleLoop(void)
       float ave_pwm;
       float left_pwm;
       float right_pwm;
-      float trim;
       float d_prev_actual;   /* Actual1 BEFORE PID_Update overwrites it */
 
-  /* Tutorial: |Angle| > 50 deg -> RunFlag = 0 (motors off). */
-  if ((s_fault_protect != 0U) && (fabsf(s_angle) > APP_BAL_FAULT_DEG))
+  /* Tutorial: |Angle| > 50 deg -> RunFlag = 0 (motors off). Always on. */
+  if (fabsf(s_angle) > APP_BAL_FAULT_DEG)
   {
     s_state = APP_BAL_STATE_FAULT;
     s_duty = 0;
@@ -287,11 +277,8 @@ static void RunAngleLoop(void)
     return;
   }
 
-  trim = (float)s_target_offset100 / 100.0f;
-
-  /* Cascade setpoint from the 50 ms speed loop, plus operator trim. Written
-   * every 10 ms so a TARGET command takes effect immediately. */
-  s_angle_pid.Target = s_speed_out_hold + trim;
+  /* Cascade setpoint from the 50 ms speed loop; operator trim is fixed 0. */
+  s_angle_pid.Target = s_speed_out_hold;
   s_angle_pid.Actual = s_angle;
   /* Snapshot the previous sample: PID_Update() sets Actual1 = Actual at its
    * end, so reading Actual1 afterwards always gives zero for the D term. */
@@ -322,10 +309,10 @@ static void RunAngleLoop(void)
                      APP_BAL_PWM_SCALE * 100.0f);
   s_vel100 = (int32_t)(s_speed_out_hold * 100.0f);
   s_turn = s_dif_pwm;
-  s_duty = (int16_t)(ave_pwm * (float)s_output_sign);
+  s_duty = (int16_t)(ave_pwm * APP_BAL_OUTPUT_SIGN);
 
-  App_MotorTest_DriveLR((int16_t)(left_pwm * (float)s_output_sign),
-                        (int16_t)(right_pwm * (float)s_output_sign));
+  App_MotorTest_DriveLR((int16_t)(left_pwm * APP_BAL_OUTPUT_SIGN),
+                        (int16_t)(right_pwm * APP_BAL_OUTPUT_SIGN));
 }
 
 /* ==========================================================================
@@ -368,17 +355,6 @@ void App_Balance_Init(void)
   s_vel100 = 0;
   s_turn = 0;
   s_enc_tps = 0;
-  s_target_offset100 = 0L;
-  s_target_speed100 = 0L;
-  s_target_turn100 = 0L;
-  s_output_sign = (int8_t)APP_BAL_OUTPUT_SIGN;
-  s_fault_protect = 1U;
-  s_perf_prev_us = 0U;
-  s_perf_acc_us = 0U;
-  s_perf_max_us = 0U;
-  s_perf_n = 0U;
-  s_perf_avg_us = 0U;
-  s_perf_peak_us = 0U;
   s_ctrl_div = 0U;
   App_Balance_ResetIntegrals();
   s_last_us = BSP_GetMicros();
@@ -391,28 +367,6 @@ void App_Balance_Init(void)
 
 void App_Balance_Tick(uint32_t now_ms)
 {
-  uint32_t now_us;
-
-  /* Measure the real 5 ms task period for PERF (informational only). */
-  now_us = BSP_GetMicros();
-  if (s_perf_prev_us != 0U)
-  {
-    uint32_t d = now_us - s_perf_prev_us;
-    if (d > 20000U) { d = 20000U; }
-    s_perf_acc_us += d;
-    s_perf_n++;
-    if (d > s_perf_max_us) { s_perf_max_us = d; }
-    if (s_perf_acc_us >= 1000000U)
-    {
-      s_perf_avg_us  = s_perf_acc_us / s_perf_n;
-      s_perf_peak_us = s_perf_max_us;
-      s_perf_acc_us  = 0U;
-      s_perf_max_us  = 0U;
-      s_perf_n       = 0U;
-    }
-  }
-  s_perf_prev_us = now_us;
-
   /* Sample encoders on the 5 ms tick and accumulate a clean 50 ms window. */
   BSP_Encoder_Update(now_ms);
   s_enc_acc_l += (int32_t)BSP_Encoder_GetDelta(BSP_ENC_LEFT);
@@ -535,8 +489,7 @@ uint8_t App_Balance_Enable(uint8_t on)
 
   if (s_imu_ok == 0U)            { return 1U; }
   if (s_state == APP_BAL_STATE_CAL) { return 2U; }
-  if (fabsf(s_angle - ((float)s_target_offset100 / 100.0f)) >
-      APP_BAL_ARM_MAX_DEG)
+  if (fabsf(s_angle) > APP_BAL_ARM_MAX_DEG)
   {
     return 3U;
   }
@@ -583,79 +536,6 @@ void App_Balance_GetTurnGains(int32_t *kp100, int32_t *ki100)
 {
   if (kp100 != 0) { *kp100 = (int32_t)(s_turn_pid.Kp * 100.0f); }
   if (ki100 != 0) { *ki100 = (int32_t)(s_turn_pid.Ki * 100.0f); }
-}
-
-void App_Balance_SetTargetSpeed(int32_t rps100)
-{
-  s_target_speed100 = (int32_t)ClampF((float)rps100,
-                                      -(float)APP_BAL_SPEED_MAX_PULSE,
-                                      (float)APP_BAL_SPEED_MAX_PULSE);
-}
-
-int32_t App_Balance_GetTargetSpeed(void)
-{
-  return s_target_speed100;
-}
-
-void App_Balance_SetYawRate(int32_t dif100)
-{
-  s_target_turn100 = (int32_t)ClampF((float)dif100,
-                                     -(float)APP_BAL_TURN_RC_LIMIT,
-                                     (float)APP_BAL_TURN_RC_LIMIT);
-}
-
-int32_t App_Balance_GetYawRate(void)
-{
-  return s_target_turn100;
-}
-
-void App_Balance_SetTargetOffset(int32_t target100)
-{
-  s_target_offset100 = (int32_t)ClampF((float)target100, -3000.0f, 3000.0f);
-}
-
-int32_t App_Balance_GetTargetOffset(void)
-{
-  return s_target_offset100;
-}
-
-void App_Balance_SetOutputSign(int8_t sign)
-{
-  s_output_sign = (sign < 0) ? -1 : 1;
-}
-
-int8_t App_Balance_GetOutputSign(void)
-{
-  return s_output_sign;
-}
-
-void App_Balance_SetFaultProtect(uint8_t on)
-{
-  s_fault_protect = (on != 0U) ? 1U : 0U;
-}
-
-uint8_t App_Balance_GetFaultProtect(void)
-{
-  return s_fault_protect;
-}
-
-/* OFFSET is specified in real PWM counts (0..1000); the PID stores it in the
- * tutorial's percent domain, hence the /72 and *72. */
-void App_Balance_SetDeadband(int32_t counts)
-{
-  s_angle_pid.OutOffset = ClampF((float)counts / APP_BAL_PWM_SCALE,
-                                 0.0f, 1000.0f / APP_BAL_PWM_SCALE);
-}
-
-int32_t App_Balance_GetDeadband(void)
-{
-  return (int32_t)(s_angle_pid.OutOffset * APP_BAL_PWM_SCALE);
-}
-
-void App_Balance_GetLoopPerf(uint32_t *avg_us, uint32_t *peak_us)
-{
-  if (avg_us != 0)  { *avg_us  = s_perf_avg_us; }
-  if (peak_us != 0) { *peak_us = s_perf_peak_us; }
 }
 
 void App_Balance_GetStatus(AppBalance_Status_t *out)
