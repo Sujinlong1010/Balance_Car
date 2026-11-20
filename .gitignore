@@ -30,3 +30,6 @@ Desktop.ini
 
 # Git
 .git/
+
+# PID tuner local data (saved parameter snapshots)
+Tools/PID_Tuner/presets.json

@@ -55,6 +55,17 @@ python Tools/PID_Tuner/pid_tuner.py
 擦写寿命约 1 万次，供偶尔保存足够；想回到出厂参考值，点「恢复参考值」后再点
 一次「保存到小车」覆盖即可。
 
+保存到底成没成功，看接收区最后一行：
+
+| 回执 | 含义 | 处理 |
+| --- | --- | --- |
+| `LOG,Params saved to flash - survives power off` | 写入成功 | 断电重上电，会看到 `restored from flash` |
+| `LOG,ERR SAVE rejected - BAL,0 first` | 还在 RUN/CAL | 先点急停，等状态变 IDLE 再存 |
+| `LOG,ERR SAVE flash write failed` | 页被写保护/读保护 | 检查选项字节里的保护位 |
+| `LOG,ERR unknown cmd` | 固件里没 SAVE | 烧的是旧 hex，重新编译烧录 |
+
+上位机标签会自动变成「✅ 已存入小车 Flash」，3 秒无回执则提示检查串口。
+
 ## 烧录
 
 用 Keil 打开 `MDK-ARM/Balance_Car.uvprojx` 编译，或直接烧录 `MDK-ARM/Balance_Car/Balance_Car.hex`。

@@ -330,6 +330,7 @@ class PIDTuner:
         self._demo_deriv = 0.0
         self._demo_ms = 0
         self._last_bst_query = 0.0
+        self._save_pending = 0.0            # monotonic stamp of the last SAVE, 0 = idle
 
         self._build_ui()
         self._refresh_ports()
@@ -760,6 +761,12 @@ class PIDTuner:
             elif kind == "error":
                 self._log("[串口错误] %s\n" % payload)
                 self._close_port()
+        if (self._save_pending != 0.0
+                and (time.monotonic() - self._save_pending) > 3.0):
+            self._save_pending = 0.0
+            self.ack_var.set("⚠️ 3 秒没收到回执，检查串口/固件")
+            self._log("[保存] 3 秒内无回执：确认串口已连接、波特率 115200、"
+                      "且固件里有 SAVE 命令\n")
         if self.demo.get():
             self._demo_tick()
         if not self.demo.get() and self.ser is not None and self.ser.is_open:
@@ -815,6 +822,9 @@ class PIDTuner:
                 self._on_line(line)
 
     def _on_line(self, line):
+        if line.startswith("LOG,"):
+            self._handle_log(line[4:])
+            return
         t = parse_telemetry(line)
         if t is not None:
             now = time.monotonic() - self.t0
@@ -877,6 +887,40 @@ class PIDTuner:
                 self.motor_state.set("FAULT · 已急停")
             else:
                 self.motor_state.set("IDLE · 电机停")
+            return
+
+    def _handle_log(self, text):
+        """把固件 LOG 回执翻译成明确结论，并清掉「保存中」等待状态。
+
+        旧版本只把标签设成「保存中…」却从不解析回执，所以保存成功也像卡死。
+        现在四种结果各有各的提示：成功 / 运行中被拒 / 写 Flash 失败 / 固件太旧。
+        """
+        low = text.lower()
+        pending = self._save_pending != 0.0
+
+        if "params saved to flash" in low:
+            self._save_pending = 0.0
+            self.ack_var.set("✅ 已存入小车 Flash，断电不丢")
+            self._mark_event("SAVE 成功")
+            self._log("[保存] 成功：参数已写入 Flash，下次上电自动恢复\n")
+            return
+        if "save flash write failed" in low:
+            self._save_pending = 0.0
+            self.ack_var.set("❌ Flash 写入失败（页被写保护？）")
+            self._log("[保存] 固件回报写入失败：检查是否开了读保护/写保护\n")
+            return
+        if "save rejected" in low:
+            self._save_pending = 0.0
+            self.ack_var.set("❌ 小车还在运行/标定，先急停再保存")
+            self._log("[保存] 被拒绝：点「急停」等状态变成 IDLE 后再点保存\n")
+            return
+        if "unknown cmd" in low and pending:
+            self._save_pending = 0.0
+            self.ack_var.set("⚠️ 固件不认识 SAVE，请烧录最新 hex")
+            self._log("[保存] 当前固件没有 SAVE 命令：重新编译烧录后可用\n")
+            return
+        if "params restored from flash" in low:
+            self.ack_var.set("小车已从 Flash 恢复参数")
             return
 
     # ------------------------------------------------------------------ send
@@ -954,8 +998,11 @@ class PIDTuner:
     def _save_params(self):
         """SAVE writes the current gains into the car's flash (survives off)."""
         if self._motor_cmd("SAVE\n", "SAVE"):
-            self.ack_var.set("保存中…（运行中固件会拒绝，先急停）")
+            self._save_pending = time.monotonic()
+            self.ack_var.set("保存中… 等小车回执（约 0.1 s）")
             self._mark_event("点击 保存到小车 SAVE")
+        else:
+            self._save_pending = 0.0
 
     def _three_loop_preset(self):
         """恢复实车调出的参考参数（已固化进固件），并同步滑块后立即下发。"""
@@ -1145,6 +1192,11 @@ class PIDTuner:
             "  编码器方向、轮动力补偿均为固件常量。\n"
             "\n"
             "参考值: 角度 3.30/0.15/3.00，速度 0.80/0.065，转向 3.00/4.00。\n"
+            "保存判读: 点「保存到小车」后看接收区最后一行——\n"
+            "  LOG,Params saved to flash        -> 成功，断电不丢\n"
+            "  LOG,ERR SAVE rejected            -> 还在跑，先点急停\n"
+            "  LOG,ERR unknown cmd              -> 烧的是旧 hex，重新烧录\n"
+            "  也可断电重上电，接收区出现 restored from flash 即已生效。\n"
             "运行中调参: 输入框/滑块 ↑↓ 微调(Shift 10x, Ctrl 100x)或拖滑块。\n"
             "上车: 扶正静止上电 -> CAL -> 开始平衡；异常点急停 BAL,0。\n"
             "HC-05 需先配置 AT+UART=115200,0,0")
