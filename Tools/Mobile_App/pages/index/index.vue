@@ -42,7 +42,9 @@
 
       <view class="staterow">
         <text class="badge" :class="stateClass">{{ stateName }}</text>
-        <text class="hint" v-if="state === 0">已急停，电机不通电</text>
+        <text class="hint" :class="{ warn: state === 0 && !canArm }" v-if="state === 0">
+          {{ canArm ? '已急停，电机不通电' : '倾斜 ' + angle.toFixed(1) + '° 超过 ' + armMax + '°，扶正才能启动' }}
+        </text>
         <text class="hint" v-else-if="state === 1">标定中 · 扶正保持静止 {{ cal }}%</text>
         <text class="hint" v-else-if="state === 2">闭环运行 · 按住方向键行驶</text>
         <text class="hint" v-else>保护停机 · 车身超过 50°，先急停再标定</text>
@@ -188,6 +190,9 @@ export default {
       // 行驶
       pct: 40,
       keys: { w: false, s: false, a: false, d: false },
+      // 必须和固件 Core/Inc/app_balance.h 的 APP_BAL_ARM_MAX_DEG 一致，
+      // 只是用来在手机上提前拦住明显起不来的情况
+      armMax: 12,
 
       // 调参
       pid: { kp: 3.30, ki: 0.15, kd: 3.00, kvp: 0.800, kvi: 0.065, ktp: 3.00, kti: 4.00 },
@@ -217,6 +222,7 @@ export default {
     stateClass() {
       return ['b-idle', 'b-cal', 'b-run', 'b-fault'][this.state] || 'b-idle'
     },
+    canArm() { return this.state === 0 && Math.abs(this.angle) <= this.armMax },
     lastLogs() { return this.logs.slice(-3) }
   },
 
@@ -386,16 +392,29 @@ export default {
           this.cmdTurn = d.turn
           if (!d.running) { this.pushLog('提示：小车未使能，先点「开始平衡」') }
           break
-        case 'log':
-          this.pushLog((d.error ? '! ' : '· ') + d.text)
-          if (/Params saved to flash/.test(d.text)) {
+        case 'log': {
+          const t = d.text || ''
+          const msg = t.replace(/^ERR\s*/, '')
+          this.pushLog((d.error ? '! ' : '· ') + t)
+          if (/Calibrated centre/.test(t)) {
+            uni.showToast({ title: '标定完成', icon: 'success' })
+          } else if (/Params saved to flash/.test(t)) {
             uni.showToast({ title: '已存入 Flash', icon: 'success' })
-          } else if (/SAVE rejected/.test(d.text)) {
+          } else if (/BAL,1 rejected/.test(t)) {
+            // 固件已经把原因写在正文里（IMU / 还在标定 / 倾角超限），
+            // 用弹窗逼着看一眼，不要只闪一下 toast。
+            uni.showModal({ title: '启动被拒绝', content: msg, showCancel: false })
+          } else if (/SAVE rejected/.test(t)) {
             uni.showToast({ title: '运行中不能存，先急停', icon: 'none' })
-          } else if (/unknown cmd/.test(d.text)) {
+          } else if (/SAVE flash write failed/.test(t)) {
+            uni.showToast({ title: 'Flash 写入失败', icon: 'none' })
+          } else if (/unknown cmd/.test(t)) {
             uni.showToast({ title: '固件太旧，请烧最新 hex', icon: 'none' })
+          } else if (d.error) {
+            uni.showToast({ title: msg.slice(0, 40), icon: 'none', duration: 2600 })
           }
           break
+        }
       }
     },
 
@@ -468,6 +487,31 @@ export default {
 
     doBalOn() {
       if (!this.connected) { return this.needConn() }
+      // 先在手机上把明显不成立的情况挡掉，省得发出去被固件拒
+      if (this.state === 1) {
+        uni.showToast({
+          title: '还在标定 ' + this.cal + '%，扶稳等它到 100%',
+          icon: 'none', duration: 2600
+        })
+        return
+      }
+      if (this.state === 2) {
+        uni.showToast({ title: '已经在平衡了', icon: 'none' })
+        return
+      }
+      if (this.state === 3) {
+        uni.showToast({ title: '保护停机中，先点「急停」', icon: 'none', duration: 2600 })
+        return
+      }
+      if (!this.canArm) {
+        uni.showModal({
+          title: '车身太斜',
+          content: '当前 ' + this.angle.toFixed(1) + '°，固件要求 ' + this.armMax +
+                   '° 以内才能启动。\n\n扶到竖直再点一次；如果扶正了角度还这么大，说明标定值不对，重新做一次「扶正标定」。',
+          showCancel: false
+        })
+        return
+      }
       uni.showModal({
         title: '开始平衡',
         content: '确认已标定、车基本竖直、周围无障碍？',
@@ -713,6 +757,7 @@ export default {
 .b-run   { background-color: #12351f; color: #51cf66; }
 .b-fault { background-color: #3d1414; color: #ff8787; }
 .hint { font-size: 22rpx; color: #6b7c8f; flex: 1; }
+.hint.warn { color: #ffa94d; }
 
 /* ---- 波形 ---- */
 .wave { margin: 8rpx 0; border-radius: 12rpx; background-color: #0f1720; }

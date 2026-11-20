@@ -232,7 +232,38 @@ static void HandleLine(char *line)
     if ((p[0] == '1') && (p[1] == '\0'))
     {
       uint8_t rc = App_Balance_Enable(1U);
-      if (rc != 0U) { SendErr("BAL,1 rejected - level car then CAL"); }
+      if (rc != 0U)
+      {
+        /* "rejected" alone sends people hunting for wiring faults when the
+         * real cause is a car still in CAL or simply tilted. Name the reason
+         * and quote the numbers the operator needs. */
+        AppBalance_Status_t st;
+        App_Balance_GetStatus(&st);
+
+        if (rc == 1U)
+        {
+          SendErr("BAL,1 rejected - IMU not responding, check MPU6050");
+        }
+        else if (rc == 2U)
+        {
+          (void)sprintf(s_tx,
+                        "LOG,ERR BAL,1 rejected - CAL still at %u%%, hold still for 1 s\n",
+                        (unsigned int)st.cal_progress);
+          (void)HC05_SendString(s_tx);
+        }
+        else
+        {
+          int32_t a10 = (int32_t)(st.angle * 10.0f);
+          const char *sgn = (a10 < 0) ? "-" : "+";
+
+          if (a10 < 0) { a10 = -a10; }
+          (void)sprintf(s_tx,
+                        "LOG,ERR BAL,1 rejected - tilt %s%ld.%ld deg (limit %ld), level the car\n",
+                        sgn, (long)(a10 / 10L), (long)(a10 % 10L),
+                        (long)APP_BAL_ARM_MAX_DEG);
+          (void)HC05_SendString(s_tx);
+        }
+      }
     }
     else if ((p[0] == '0') && (p[1] == '\0'))
     {

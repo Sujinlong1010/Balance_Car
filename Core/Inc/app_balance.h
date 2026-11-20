@@ -228,6 +228,9 @@ void    App_Balance_Init(void);
 void    App_Balance_Tick(uint32_t now_ms);   /* called every 5 ms by FreeRTOS */
 
 uint8_t App_Balance_Calibrate(void);
+/* 0 = ok, otherwise: 1 = IMU not ready, 2 = CAL still running,
+ * 3 = |angle| > APP_BAL_ARM_MAX_DEG (car not level). The protocol layer
+ * turns these into distinct LOG lines so the operator knows what to fix. */
 uint8_t App_Balance_Enable(uint8_t on);
 
 /* Angle loop gains, x100. */
