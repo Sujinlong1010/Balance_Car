@@ -1,0 +1,19 @@
+{
+  "pages": [
+    {
+      "path": "pages/index/index",
+      "style": {
+        "navigationBarTitleText": "平衡车遥控",
+        "navigationBarBackgroundColor": "#0b1016",
+        "navigationBarTextStyle": "white",
+        "backgroundColor": "#0b1016"
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationBarTextStyle": "white",
+    "navigationBarTitleText": "平衡车遥控",
+    "navigationBarBackgroundColor": "#0b1016",
+    "backgroundColor": "#0b1016"
+  }
+}

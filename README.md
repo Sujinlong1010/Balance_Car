@@ -56,9 +56,22 @@ Core/              用户源码（app_balance.c 三环控制、app_pid_tune.c �
 Drivers/           STM32 HAL 库 + CMSIS
 Middlewares/       FreeRTOS
 MDK-ARM/           Keil 工程文件 + 可烧录 hex（MDK-ARM/Balance_Car/Balance_Car.hex）
-Tools/PID_Tuner/   上位机 PID 调试助手（Python + tkinter）
+Tools/PID_Tuner/   电脑上位机 PID 调试助手（Python + tkinter）
+Tools/Mobile_App/  手机 App 上位机（uni-app + 经典蓝牙 SPP，HBuilderX 打 APK）
 Balance_Car.ioc    STM32CubeMX 工程配置
 ```
+
+## 手机 App（安卓）
+
+`Tools/Mobile_App/` 是一个 uni-app 工程，功能对齐电脑上位机：驾驶（方向键 + 限速）、
+三环 7 项增益调参、实时波形、参数存档、通信日志。**固件不用改**，发的是同一套协议。
+
+关键点：HC-05 是经典蓝牙 SPP，而 uni-app 的蓝牙 API 只支持 BLE，所以这里用
+Native.js 直接调安卓原生 `BluetoothSocket`（`common/spp.js`）。HBuilderX 云打包
+安卓 APK 免费（用「云端证书」，2026 年起公共测试证书已停用），超出免费额度 2 元/次。
+
+详细步骤见 `Tools/Mobile_App/README.md`：装 HBuilderX → 补 AppID → 配对 HC-05 →
+真机基座调通 → 云打包出 APK。调试阶段用「运行到手机基座」不消耗打包次数。
 
 ## 上位机
 
