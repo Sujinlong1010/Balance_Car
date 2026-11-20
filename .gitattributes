@@ -1,0 +1,22 @@
+# 二进制文件：不做行尾转换，也不尝试文本 diff
+*.hex   binary
+*.bin   binary
+*.apk   binary
+*.lib   binary
+*.a     binary
+*.o     binary
+*.axf   binary
+*.png   binary
+*.jpg   binary
+
+# Windows 批处理：保持原样，别让 git 改写行尾
+# （cmd.exe 对 LF 的标签跳转处理有坑）
+*.bat   -text
+*.cmd   -text
+
+# vendor 代码不计入 GitHub 语言统计，
+# 否则首页会显示「99.6% C」，自己写的 Core/ 被淹掉
+Drivers/STM32F1xx_HAL_Driver/**  linguist-vendored
+Drivers/CMSIS/**                 linguist-vendored
+Middlewares/Third_Party/**       linguist-vendored
+MDK-ARM/startup_stm32f103xb.s    linguist-vendored

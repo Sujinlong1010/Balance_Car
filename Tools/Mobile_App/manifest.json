@@ -33,7 +33,9 @@
                     "<uses-permission android:name=\"android.permission.VIBRATE\"/>"
                 ]
             },
-            "ios" : {},
+            "ios" : {
+                "dSYMs" : false
+            },
             "sdkConfigs" : {}
         }
     },

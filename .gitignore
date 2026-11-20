@@ -1,4 +1,6 @@
-# Keil / MDK-ARM build artifacts
+# ============================================================
+#  Keil / MDK-ARM —— 编译产物，全部可重新生成
+# ============================================================
 MDK-ARM/Balance_Car/*.o
 MDK-ARM/Balance_Car/*.d
 MDK-ARM/Balance_Car/*.crf
@@ -10,30 +12,45 @@ MDK-ARM/Balance_Car/*.lnp
 MDK-ARM/Balance_Car/*.dep
 MDK-ARM/Balance_Car/*.lst
 MDK-ARM/Balance_Car/*.bak
+MDK-ARM/Balance_Car/*.iex
+MDK-ARM/Balance_Car/*.scvd
 MDK-ARM/*.lst
 MDK-ARM/build*.log
-MDK-ARM/*.uvguix.*
 
-# Python
+# 每次编译都会重写一遍，而且含本机窗口布局和断点，不该进版本库
+MDK-ARM/*.uvoptx
+MDK-ARM/*.uvguix.*
+JLinkLog.txt
+
+# 注意：MDK-ARM/Balance_Car/Balance_Car.hex 是特意保留的，
+# 没装 Keil 的机器可以直接拿它烧录。
+
+# ============================================================
+#  Python（Tools/PID_Tuner）
+# ============================================================
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
+.pip-build/
 
-# OS / editor
+# 调参过程中存的参数快照，属于本机数据
+Tools/PID_Tuner/presets.json
+
+# ============================================================
+#  HBuilderX / uni-app
+# ============================================================
+Tools/Mobile_App/unpackage/
+Tools/Mobile_App/.hbuilderx/
+Tools/Mobile_App/node_modules/
+
+# ============================================================
+#  系统 / 编辑器
+# ============================================================
 Thumbs.db
 Desktop.ini
 .DS_Store
 *.swp
+*~
 .vscode/
 .idea/
-
-# Git
-.git/
-
-# PID tuner local data (saved parameter snapshots)
-Tools/PID_Tuner/presets.json
-
-# HBuilderX / uni-app build output
-Tools/Mobile_App/unpackage/
-Tools/Mobile_App/.hbuilderx/
