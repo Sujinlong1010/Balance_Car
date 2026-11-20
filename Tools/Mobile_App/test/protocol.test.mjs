@@ -33,14 +33,18 @@ function eq(label, got, want) {
   }
 }
 
-console.log('--- 组帧：方向/限速 ---')
+console.log('--- 组帧：双杆比例（摇杆在中间要有中间量）---')
 eq('前进 60%', buildMove(1, 0, 60), 'MOV,60,0\n')
 eq('后退 + 左转', buildMove(-1, -1, 40), 'MOV,-40,-40\n')
-eq('前进 + 右转（弧线）', buildMove(1, 1, 100), 'MOV,100,100\n')
+eq('前进 + 右转（斜推）', buildMove(1, 1, 100), 'MOV,100,100\n')
 eq('停车', buildMove(0, 0, 40), 'MOV,0,0\n')
+eq('摇杆推一半 = 半个量', buildMove(0.5, 0, 60), 'MOV,30,0\n')
+eq('摇杆 0.25 前进 + 0.75 左', buildMove(0.25, -0.75, 80), 'MOV,20,-60\n')
+eq('极小值不产生 -0', buildMove(-0.004, 0, 100), 'MOV,0,0\n')
 eq('限速夹紧 250 -> 100', buildMove(1, 0, 250), 'MOV,100,0\n')
-eq('方向夹紧 2/-3 -> 1/-1', buildMove(2, -3, 50), 'MOV,50,-50\n')
+eq('比例夹紧 2 / -3 -> 1 / -1', buildMove(2, -3, 50), 'MOV,50,-50\n')
 eq('负数限速不产生 -0', buildMove(0, 0, -10), 'MOV,0,0\n')
+eq('undefined 比例当 0', buildMove(undefined, null, 40), 'MOV,0,0\n')
 
 console.log('--- 组帧：三组增益（定点放大）---')
 eq('SET x100', buildSet(3.3, 0.15, 3.0), 'SET,330,15,300\n')

@@ -62,36 +62,51 @@
         <text class="pctval">{{ pct }}%</text>
       </view>
 
-      <!-- 方向 + 动作 -->
-      <view class="ctrl">
-        <view class="pad">
-          <view class="row">
-            <view class="k" :class="{ act: keys.w }"
-                  @touchstart.prevent="press('w')" @touchend.prevent="release('w')"
-                  @touchcancel.prevent="release('w')">前</view>
+      <!-- 双杆：左杆推前后，右杆推左右；松手自动回中 = 原地停 -->
+      <view class="sticks">
+        <view class="stickwrap">
+          <view class="stickhead">
+            <text class="sticktitle">前后</text>
+            <text class="sticknum" :class="pctClass(fwdPct)">{{ signed(fwdPct) }}</text>
           </view>
-          <view class="row">
-            <view class="k" :class="{ act: keys.a }"
-                  @touchstart.prevent="press('a')" @touchend.prevent="release('a')"
-                  @touchcancel.prevent="release('a')">左</view>
-            <view class="k stop" @click="moveStop">停</view>
-            <view class="k" :class="{ act: keys.d }"
-                  @touchstart.prevent="press('d')" @touchend.prevent="release('d')"
-                  @touchcancel.prevent="release('d')">右</view>
-          </view>
-          <view class="row">
-            <view class="k" :class="{ act: keys.s }"
-                  @touchstart.prevent="press('s')" @touchend.prevent="release('s')"
-                  @touchcancel.prevent="release('s')">后</view>
+          <view class="stick"
+                @touchstart="vStart" @touchmove.stop.prevent="vMove"
+                @touchend="vEnd" @touchcancel="vEnd">
+            <view class="axis-v"></view>
+            <view class="knob" :class="{ snap: snapV }"
+                  :style="{ transform: 'translateY(' + knobV + 'px)' }">
+              <text class="knobtxt">前</text>
+            </view>
           </view>
         </view>
 
-        <view class="acts">
-          <button class="act" @click="doCal">扶正标定</button>
-          <button class="act go" @click="doBalOn">开始平衡</button>
-          <button class="act stop" @click="doBalOff">急停</button>
-          <text class="cmdtext">目标 {{ cmdFwd > 0 ? '+' : '' }}{{ cmdFwd }}% / {{ cmdTurn > 0 ? '+' : '' }}{{ cmdTurn }}%</text>
+        <view class="stickwrap">
+          <view class="stickhead">
+            <text class="sticktitle">左右</text>
+            <text class="sticknum" :class="pctClass(turnPct)">{{ signed(turnPct) }}</text>
+          </view>
+          <view class="stick"
+                @touchstart="hStart" @touchmove.stop.prevent="hMove"
+                @touchend="hEnd" @touchcancel="hEnd">
+            <view class="axis-h"></view>
+            <view class="knob" :class="{ snap: snapH }"
+                  :style="{ transform: 'translateX(' + knobH + 'px)' }">
+              <text class="knobtxt">转</text>
+            </view>
+          </view>
         </view>
+      </view>
+
+      <text class="sticktip">
+        按住杆拖动，松手自动回中 → 原地停 · 小车收到 前 {{ signed(cmdFwd) }} 转 {{ signed(cmdTurn) }}
+      </text>
+
+      <!-- 动作 -->
+      <view class="acts-row">
+        <button class="act" @click="doCal">标定</button>
+        <button class="act go" @click="doBalOn">开始</button>
+        <button class="act stop" @click="doBalOff">急停</button>
+        <button class="act" @click="stickStop">回中</button>
       </view>
 
       <view class="logbox">
@@ -187,9 +202,12 @@ export default {
       angle: 0, target: 0, pwm: 0, vel: 0, enc: 0,
       state: 0, cal: 100, carSpd: 0, cmdFwd: 0, cmdTurn: 0,
 
-      // 行驶
+      // 行驶：双杆，每轴 -1..1（0 = 中位 = 原地停住）
       pct: 40,
-      keys: { w: false, s: false, a: false, d: false },
+      stick: { v: 0, h: 0 },
+      snapV: true,          // true 时手柄带弹回动画，拖动时关掉避免延迟
+      snapH: true,
+      knobMax: 40,          // px，onLoad 里按 90rpx 换算
       // 必须和固件 Core/Inc/app_balance.h 的 APP_BAL_ARM_MAX_DEG 一致，
       // 只是用来在手机上提前拦住明显起不来的情况
       armMax: 12,
@@ -223,6 +241,12 @@ export default {
       return ['b-idle', 'b-cal', 'b-run', 'b-fault'][this.state] || 'b-idle'
     },
     canArm() { return this.state === 0 && Math.abs(this.angle) <= this.armMax },
+    // 手柄位置（px）：左杆往上推 = 前进 = 负 Y
+    knobV() { return -this.stick.v * this.knobMax },
+    knobH() { return this.stick.h * this.knobMax },
+    // 真正下发的百分比（带中位死区，避免手指没动却让车原地蠕动）
+    fwdPct() { return Math.round(this.dead(this.stick.v) * this.pct) },
+    turnPct() { return Math.round(this.dead(this.stick.h) * this.pct) },
     lastLogs() { return this.logs.slice(-3) }
   },
 
@@ -230,6 +254,8 @@ export default {
     const si = uni.getSystemInfoSync()
     this.cw = Math.floor(si.windowWidth - 24)
     this.ch = Math.floor(Math.min(200, this.cw * 0.52))
+    // 手柄最大位移 86rpx → px（与 .stick 260rpx / .knob 88rpx 的边距一致）
+    this.knobMax = Math.max(28, Math.floor(si.windowWidth / 750 * 86))
     try {
       const saved = uni.getStorageSync('bc_presets')
       if (Array.isArray(saved)) { this.presets = saved }
@@ -327,7 +353,7 @@ export default {
 
     stopAll() {
       this.stopTimers()
-      this.keys = { w: false, s: false, a: false, d: false }
+      this.resetStick()
       if (this.connected) {
         SPP.send(buildMove(0, 0, this.pct))   // 先踩一脚刹车再走
       }
@@ -341,7 +367,7 @@ export default {
       SPP.close()
       this.connected = false
       this.hbOk = false
-      this.keys = { w: false, s: false, a: false, d: false }
+      this.resetStick()
       this.pushLog('× ' + reason)
       uni.showToast({ title: reason, icon: 'none' })
     },
@@ -427,11 +453,92 @@ export default {
       if (this.logs.length > 80) { this.logs.shift() }
     },
 
-    /* ---------------- 行驶 ---------------- */
+    /* ---------------- 双杆 ---------------- */
+    dead(v) { return Math.abs(v) < 0.06 ? 0 : v },     // 中位死区 6 %
+    clamp1(v) { return v > 1 ? 1 : (v < -1 ? -1 : v) },
+    signed(n) { return (n > 0 ? '+' : '') + n + '%' },
+    pctClass(n) { return n > 0 ? 'pos' : (n < 0 ? 'neg' : '') },
+
+    touchPos(e) {
+      const t = (e.changedTouches && e.changedTouches[0]) ||
+                (e.touches && e.touches[0])
+      return t ? { x: t.clientX, y: t.clientY } : null
+    },
+
+    vStart(e) {
+      if (!this.connected) { return this.needConn() }
+      const p = this.touchPos(e)
+      if (!p) { return }
+      this._dragV = { y0: p.y, v0: this.stick.v }
+      this.snapV = false
+    },
+
+    vMove(e) {
+      if (!this._dragV || !this.connected) { return }
+      const p = this.touchPos(e)
+      if (!p) { return }
+      // 向上拖 = 前进：屏幕 Y 向下为正，所以取负
+      this.stick.v = this.clamp1(this._dragV.v0 - (p.y - this._dragV.y0) / this.knobMax)
+      this.throttleSend()
+    },
+
+    vEnd() {
+      if (!this._dragV) { return }
+      this._dragV = null
+      this.stick.v = 0
+      this.snapV = true
+      this.pushMove()
+    },
+
+    hStart(e) {
+      if (!this.connected) { return this.needConn() }
+      const p = this.touchPos(e)
+      if (!p) { return }
+      this._dragH = { x0: p.x, h0: this.stick.h }
+      this.snapH = false
+    },
+
+    hMove(e) {
+      if (!this._dragH || !this.connected) { return }
+      const p = this.touchPos(e)
+      if (!p) { return }
+      this.stick.h = this.clamp1(this._dragH.h0 + (p.x - this._dragH.x0) / this.knobMax)
+      this.throttleSend()
+    },
+
+    hEnd() {
+      if (!this._dragH) { return }
+      this._dragH = null
+      this.stick.h = 0
+      this.snapH = true
+      this.pushMove()
+    },
+
+    stickStop() {
+      this.resetStick()
+      this.pushMove()
+      if (this.connected) { uni.showToast({ title: '已回中', icon: 'none' }) }
+    },
+
+    resetStick() {
+      this.stick.v = 0
+      this.stick.h = 0
+      this._dragV = null
+      this._dragH = null
+      this.snapV = true
+      this.snapH = true
+    },
+
+    /* 拖动时 60 ms 节流直发，手感跟手；100 ms 心跳兜底。 */
+    throttleSend() {
+      const now = Date.now()
+      if (now - (this._lastSend || 0) < 60) { return }
+      this._lastSend = now
+      this.pushMove()
+    },
+
     heartbeatFrame() {
-      const fwd = (this.keys.w ? 1 : 0) - (this.keys.s ? 1 : 0)
-      const turn = (this.keys.d ? 1 : 0) - (this.keys.a ? 1 : 0)
-      return buildMove(fwd, turn, this.pct)
+      return buildMove(this.dead(this.stick.v), this.dead(this.stick.h), this.pct)
     },
 
     tickMove() {
@@ -442,27 +549,6 @@ export default {
     pushMove() {
       if (!this.connected) { return }
       SPP.send(this.heartbeatFrame())
-    },
-
-    press(k) {
-      if (!this.connected) {
-        uni.showToast({ title: '先连接蓝牙', icon: 'none' })
-        return
-      }
-      this.keys[k] = true
-      this.pushMove()
-      try { uni.vibrateShort() } catch (e) { /* ignore */ }
-    },
-
-    release(k) {
-      this.keys[k] = false
-      this.pushMove()
-    },
-
-    moveStop() {
-      this.keys = { w: false, s: false, a: false, d: false }
-      this.pushMove()
-      if (this.connected) { uni.showToast({ title: '停车', icon: 'none' }) }
     },
 
     onPct(e) {
@@ -517,7 +603,7 @@ export default {
         content: '确认已标定、车基本竖直、周围无障碍？',
         success: res => {
           if (res.confirm) {
-            this.keys = { w: false, s: false, a: false, d: false }
+            this.resetStick()
             SPP.send(buildMove(0, 0, this.pct))
             SPP.send(CMD.on)
             this.pushLog('发送 BAL,1')
@@ -528,7 +614,7 @@ export default {
 
     doBalOff() {
       if (!this.connected) { return }
-      this.keys = { w: false, s: false, a: false, d: false }
+      this.resetStick()
       SPP.send(buildMove(0, 0, this.pct))
       SPP.send(CMD.off)
       this.pushLog('发送 BAL,0 急停')
@@ -768,29 +854,89 @@ export default {
 .pctslider { flex: 1; margin: 0 8rpx; }
 .pctval { font-size: 26rpx; color: #51cf66; width: 80rpx; text-align: right; }
 
-/* ---- 控制区 ---- */
-.ctrl { display: flex; margin-top: 8rpx; }
-.pad { flex: 1.25; }
-.pad .row { display: flex; justify-content: center; }
-.k {
-  width: 30%;
-  height: 104rpx;
-  line-height: 104rpx;
-  text-align: center;
-  background-color: #1a2531;
-  color: #c8d6e5;
-  border-radius: 14rpx;
-  margin: 5rpx;
-  font-size: 32rpx;
-  font-weight: 600;
-  user-select: none;
-}
-.k.act { background-color: #1c7ed6; color: #ffffff; }
-.k.stop { background-color: #3d1414; color: #ff8787; }
+/* ---- 双杆控制区 ---- */
+.sticks { display: flex; margin-top: 10rpx; }
 
-.acts { flex: 1; display: flex; flex-direction: column; justify-content: center; }
+.stickwrap { flex: 1; min-width: 0; }
+
+.stickhead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 0 12rpx 6rpx;
+}
+.sticktitle { font-size: 22rpx; color: #7d8fa3; }
+.sticknum { font-size: 22rpx; font-weight: 700; color: #8fa3b8; }
+.sticknum.pos { color: #f03e3e; }   /* 前进 / 右转：红（涨） */
+.sticknum.neg { color: #37b24d; }   /* 后退 / 左转：绿（跌） */
+
+/* 轨道 260rpx 高、手柄 88rpx：(260-88)/2 = 86rpx 最大位移，
+   与 onLoad 里 knobMax = 86rpx 换算成 px 完全对应，手柄不会顶出边框 */
+.stick {
+  position: relative;
+  height: 260rpx;
+  margin: 0 6rpx;
+  background-color: #111820;
+  border: 1rpx solid #1e2b38;
+  border-radius: 16rpx;
+  overflow: hidden;
+}
+
+/* 中位参考线（显式定位，不靠 static-position，WebView 里更稳） */
+.axis-v {
+  position: absolute;
+  left: 50%;
+  top: 10%;
+  margin-left: -1rpx;
+  width: 2rpx;
+  height: 80%;
+  background-color: #1e2b38;
+}
+.axis-h {
+  position: absolute;
+  top: 50%;
+  left: 10%;
+  margin-top: -1rpx;
+  height: 2rpx;
+  width: 80%;
+  background-color: #1e2b38;
+}
+
+/* 手柄：left/top 50% + 负 margin 居中，transform 只负责位移，
+   这样 :style 覆盖 transform 时不会把居中一起冲掉 */
+.knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  margin-left: -44rpx;
+  margin-top: -44rpx;
+  width: 88rpx;
+  height: 88rpx;
+  border-radius: 50%;
+  background-color: #2b3d50;
+  border: 2rpx solid #3d5468;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 2rpx 10rpx rgba(0, 0, 0, 0.45);
+}
+/* 拖动时 snap=false → 无过渡，跟手；松手 snap=true → 弹回中间 */
+.knob.snap { transition: transform 0.16s ease-out; }
+.knobtxt { font-size: 24rpx; color: #8fa3b8; }
+
+.sticktip {
+  display: block;
+  font-size: 22rpx;
+  color: #5c6f85;
+  text-align: center;
+  line-height: 1.5;
+  margin-top: 8rpx;
+}
+
+.acts-row { display: flex; margin-top: 10rpx; }
 .act {
-  margin: 5rpx 0;
+  flex: 1;
+  margin: 0 5rpx;
   font-size: 26rpx;
   background-color: #1a2531;
   color: #c8d6e5;
@@ -798,7 +944,6 @@ export default {
 }
 .act.go { background-color: #12351f; color: #51cf66; }
 .act.stop { background-color: #3d1414; color: #ff8787; }
-.cmdtext { font-size: 22rpx; color: #5c6f85; text-align: center; margin-top: 6rpx; }
 
 /* ---- 日志 ---- */
 .logbox {

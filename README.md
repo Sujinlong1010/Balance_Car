@@ -63,7 +63,7 @@ Balance_Car.ioc    STM32CubeMX 工程配置
 
 ## 手机 App（安卓）
 
-`Tools/Mobile_App/` 是一个 uni-app 工程，功能对齐电脑上位机：驾驶（方向键 + 限速）、
+`Tools/Mobile_App/` 是一个 uni-app 工程，功能对齐电脑上位机：驾驶（前后/左右双杆摇杆 + 限速）、
 三环 7 项增益调参、实时波形、参数存档、通信日志。**固件不用改**，发的是同一套协议。
 
 关键点：HC-05 是经典蓝牙 SPP，而 uni-app 的蓝牙 API 只支持 BLE，所以这里用

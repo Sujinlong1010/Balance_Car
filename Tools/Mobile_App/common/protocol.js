@@ -11,13 +11,18 @@
 
 export const BST_STATES = { 0: 'IDLE', 1: 'CAL', 2: 'RUN', 3: 'FAULT' }
 
-/* 方向 -1/0/1 + 限速百分比 -> MOV 帧。
+/* 方向比例 + 限速百分比 -> MOV 帧。
+ *
+ * fwd / turn 是 -1..1 的比例（摇杆位置），不是整数档位：摇杆推一半就是
+ * 一半的量，所以这里只夹紧不取整，取整放到最后乘完 pct 之后做。
  * 固件把 MOV 当失联看门狗：同一个值重复发就是心跳，不会重复回执。 */
 export function buildMove(fwd, turn, pct) {
   const p = Math.max(0, Math.min(100, Math.round(pct)))
-  const f = Math.max(-1, Math.min(1, Math.round(fwd)))
-  const t = Math.max(-1, Math.min(1, Math.round(turn)))
-  return 'MOV,' + (f * p) + ',' + (t * p) + '\n'
+  const f = Math.max(-1, Math.min(1, Number(fwd) || 0))
+  const t = Math.max(-1, Math.min(1, Number(turn) || 0))
+  const fv = Math.round(f * p)
+  const tv = Math.round(t * p)
+  return 'MOV,' + (fv === 0 ? 0 : fv) + ',' + (tv === 0 ? 0 : tv) + '\n'
 }
 
 export function buildSet(kp, ki, kd) {
