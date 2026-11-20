@@ -52,14 +52,48 @@ MOV,<fwd>,<turn>      百分比 -100..100，fwd + = 前进，turn + = 右转
 ## 目录结构
 
 ```
-Core/              用户源码（app_balance.c 三环控制、app_pid_tune.c 通信协议等）
-Drivers/           STM32 HAL 库 + CMSIS
-Middlewares/       FreeRTOS
-MDK-ARM/           Keil 工程文件 + 可烧录 hex（MDK-ARM/Balance_Car/Balance_Car.hex）
-Tools/PID_Tuner/   电脑上位机 PID 调试助手（Python + tkinter）
-Tools/Mobile_App/  手机 App 上位机（uni-app + 经典蓝牙 SPP，HBuilderX 打 APK）
-Balance_Car.ioc    STM32CubeMX 工程配置
+Core/Inc, Core/Src   自己写的代码（约 50 个文件）
+  app_balance.c        三环 PID：角度环 / 速度环 / 转向环 + MOV 遥控
+  app_pid_tune.c       蓝牙 ASCII 协议解析与回执
+  bsp_*.c              外设驱动：MPU6050 / TB6612 / 编码器 / HC-05 / Flash / OLED
+Drivers/             STM32F1 HAL + CMSIS 头文件（vendor，见下）
+Middlewares/         FreeRTOS（vendor）
+MDK-ARM/             Keil 工程 + 可直接烧录的 hex
+Tools/PID_Tuner/     电脑上位机（Python + tkinter）
+Tools/Mobile_App/    手机 App 上位机（uni-app + 经典蓝牙 SPP）
+Balance_Car.ioc      STM32CubeMX 工程配置
 ```
+
+**`Drivers/` 是精简过的。** CubeMX 生成代码时会把整个 CMSIS 包拷进来，其中
+DSP 库、NN 库、预编译数学库（`Lib/` 单个文件 13 MB）、RTOS/RTOS2、各内核模板，
+这个工程一个都没用上，已经删掉。现在只保留 `STM32F1xx_HAL_Driver` 和 CMSIS 的
+`Include` / `Device/ST/STM32F1xx/Include`。
+
+以后用 CubeMX 重新生成代码，这些东西可能被重新拷回来——不影响编译（Keil 的
+include 路径里没有它们），再删一次即可。同理 `STM32F1xx_HAL_Driver` 里保留了全部
+外设的 `.c`，实际只编译 17 个，想再瘦一圈就按 `Balance_Car.uvprojx` 的文件列表删。
+
+## 自测
+
+改完代码跑这几条，不用接硬件、不用连车：
+
+```bash
+# 手机端协议：组帧 / 夹紧 / 解析，55 项
+node Tools/Mobile_App/test/protocol.test.mjs
+
+# 手机端波形量程：档位 / 迟滞，22 项
+node Tools/Mobile_App/test/chart.test.mjs
+```
+
+两个都是纯函数单测，只要有 Node。固件那边用 Keil 打开
+`MDK-ARM/Balance_Car.uvprojx` 点 Rebuild，或命令行：
+
+```bash
+cd MDK-ARM && /d/keil5/UV4/UV4.exe -r Balance_Car.uvprojx -j0 -o build.log
+```
+
+（`-b` 是增量编译，只改了 vendor 相关的东西时可能什么都没编就报 0 error，
+验证要确认没删坏就用 `-r` 全量重建。）
 
 ## 手机 App（安卓）
 
@@ -72,6 +106,9 @@ Native.js 直接调安卓原生 `BluetoothSocket`（`common/spp.js`）。HBuilde
 
 详细步骤见 `Tools/Mobile_App/README.md`：装 HBuilderX → 补 AppID → 配对 HC-05 →
 真机基座调通 → 云打包出 APK。调试阶段用「运行到手机基座」不消耗打包次数。
+
+打好的 APK 在 `Tools/Mobile_App/unpackage/release/apk/`（这个目录是构建产物，
+没有进版本库；要备份就把 apk 单独拷出来）。
 
 ## 上位机
 
